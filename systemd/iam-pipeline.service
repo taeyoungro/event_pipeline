@@ -1,0 +1,19 @@
+[Unit]
+Description=IAM Pipeline Codegen + Executor Server
+After=network.target
+
+[Service]
+Type=simple
+User=ec2-user
+Group=ec2-user
+WorkingDirectory=/home/ec2-user/iam_pipeline
+EnvironmentFile=/home/ec2-user/iam_pipeline/.env
+Environment=PATH=/home/ec2-user/iam_pipeline/venv/bin:/usr/bin
+ExecStart=/home/ec2-user/iam_pipeline/venv/bin/iam-pipeline-codegen
+Restart=on-failure
+RestartSec=5
+StandardOutput=append:/home/ec2-user/iam_pipeline/logs/server.log
+StandardError=append:/home/ec2-user/iam_pipeline/logs/server.err
+
+[Install]
+WantedBy=multi-user.target
