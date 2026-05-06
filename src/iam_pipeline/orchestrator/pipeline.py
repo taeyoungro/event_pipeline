@@ -12,8 +12,12 @@ from enum import Enum
 from pathlib import Path
 from typing import Optional
 
+import boto3
+from botocore.exceptions import ClientError
+
 from ..codegen.buffer import BufferAction, RoleBuffer
 from ..codegen.policy_fetcher import PolicyFetcher
+from ..codegen.policy_utils import has_dangerous_trust, is_service_role
 from ..codegen.tf_writer import write_destroy_workspace, write_workspace
 from ..config import settings
 from ..executor.runner import TerraformRunner
@@ -46,48 +50,6 @@ def classify_failure(exc: Exception) -> FailureCategory:
     if 'dangerous trust policy' in msg:
         return FailureCategory.DANGEROUS_TRUST_POLICY
     return FailureCategory.UNKNOWN
-
-
-# ── Phase 4.3: Trust Policy 분석 ─────────────────────────────────────────────
-
-def is_service_role(trust_policy: dict) -> bool:
-    """
-    Trust Policy에 AWS/Federated Principal이 전혀 없으면 서비스 전용 Role.
-    서비스 Role에는 IIC Permission Set을 생성하지 않는다.
-    """
-    statements = trust_policy.get('Statement', [])
-    if isinstance(statements, dict):
-        statements = [statements]
-
-    for stmt in statements:
-        principal = stmt.get('Principal', {})
-        if isinstance(principal, str):
-            return False
-        if isinstance(principal, dict):
-            if 'AWS' in principal or 'Federated' in principal:
-                return False
-    return True
-
-
-def has_dangerous_trust(trust_policy: dict) -> bool:
-    """
-    Phase 4.2: Wildcard(*) Principal이 포함된 위험한 Trust Policy 감지.
-    """
-    statements = trust_policy.get('Statement', [])
-    if isinstance(statements, dict):
-        statements = [statements]
-
-    for stmt in statements:
-        principal = stmt.get('Principal', {})
-        if principal == '*':
-            return True
-        if isinstance(principal, dict):
-            for v in principal.values():
-                if v == '*':
-                    return True
-                if isinstance(v, list) and '*' in v:
-                    return True
-    return False
 
 
 # ── Phase 2.2/2.5: 태그 기반 대상 계정 파싱 ─────────────────────────────────
@@ -126,6 +88,42 @@ def parse_target_accounts(
 
 
 # ── 파이프라인 ────────────────────────────────────────────────────────────────
+
+def _check_iic_user_exists(username: str) -> bool:
+    """
+    IIC Identity Store에서 사용자 존재 여부를 사전 확인.
+    확인 불가(권한 부족 등)이면 True를 반환하여 TF 시도를 계속한다.
+    """
+    try:
+        sso = boto3.client('sso-admin', region_name=settings.aws_region)
+        instances = sso.list_instances()
+        if not instances.get('Instances'):
+            logger.warning('SSO 인스턴스를 찾을 수 없어 사용자 검증 생략')
+            return True
+        identity_store_id = instances['Instances'][0]['IdentityStoreId']
+    except ClientError as e:
+        logger.warning(f'SSO 인스턴스 조회 실패, 사용자 검증 생략: {e}')
+        return True
+
+    try:
+        id_store = boto3.client('identitystore', region_name=settings.aws_region)
+        id_store.get_user_id(
+            IdentityStoreId=identity_store_id,
+            AlternateIdentifier={
+                'UniqueAttribute': {
+                    'AttributePath': 'UserName',
+                    'AttributeValue': username,
+                }
+            },
+        )
+        return True
+    except id_store.exceptions.ResourceNotFoundException:
+        logger.info(f'IIC에 사용자 없음 — Account Assignment 생략: {username!r}')
+        return False
+    except ClientError as e:
+        logger.warning(f'사용자 존재 확인 실패, 검증 생략: {e}')
+        return True
+
 
 class Pipeline:
     """코드 생성 → 실행 통합 파이프라인"""
@@ -243,6 +241,19 @@ class Pipeline:
             f'[{request_id}] Target accounts: {target_account_ids}'
         )
 
+        # IIC 사용자 존재 여부 사전 검증 — 없으면 Assignment 블록 생략
+        skip_assignment = False
+        if buf.requester_iic_user:
+            if not _check_iic_user_exists(buf.requester_iic_user):
+                skip_assignment = True
+                logger.info(
+                    f'[{request_id}] requester_iic_user={buf.requester_iic_user!r} '
+                    f'not in IIC — skip_assignment=True'
+                )
+        else:
+            skip_assignment = True
+            logger.info(f'[{request_id}] requester_iic_user=None — skip_assignment=True')
+
         # Codegen: TF 워크스페이스 생성
         source_dir = write_workspace(
             buf=buf,
@@ -251,7 +262,7 @@ class Pipeline:
             inline_max_chars=settings.inline_policy_max_chars,
             target_account_ids=target_account_ids,
             role_inline_policies=role_inline_policies,
-            skip_assignment=False,
+            skip_assignment=skip_assignment,
         )
         logger.info(f'[{request_id}] Workspace written: {source_dir}')
 

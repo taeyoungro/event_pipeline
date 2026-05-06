@@ -16,6 +16,13 @@ SUPPORTED_EVENTS = {
     'DeleteRole',
 }
 
+# IIC/AWS가 자동 생성하는 시스템 Role — 파이프라인 처리 제외
+_SKIP_ROLE_PREFIXES = (
+    'AWSReservedSSO_',      # IIC Permission Set 할당 시 자동 생성
+    'AWSServiceRoleFor',    # AWS 서비스 연결 역할
+    'aws-reserved/',        # AWS 예약 경로 역할
+)
+
 # 이벤트명 → 버퍼 액션 매핑
 _EVENT_TO_ACTION = {
     'AttachRolePolicy': 'ATTACH',
@@ -47,6 +54,9 @@ def extract_event_info(data: dict) -> dict:
     role_name = req_params.get('roleName')
     if not role_name:
         raise ValueError("Missing roleName")
+
+    if any(role_name.startswith(prefix) for prefix in _SKIP_ROLE_PREFIXES):
+        raise ValueError(f"Skipping system/reserved role: {role_name}")
 
     account_id = detail.get('recipientAccountId') or detail.get('account')
     if not account_id:
