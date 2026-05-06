@@ -205,7 +205,8 @@ class Pipeline:
             trust_policy = {}
 
         # Phase 4.3: 서비스 Role 감지 → 스킵
-        if is_service_role(trust_policy):
+        # trust_policy가 비어있으면(조회 실패) 검사 생략 — 빈 dict를 서비스 Role로 오판하지 않도록
+        if trust_policy and is_service_role(trust_policy):
             logger.info(
                 f'[{request_id}] Skipping service role '
                 f'(no AWS/Federated principal): {buf.role_name}'
@@ -213,7 +214,7 @@ class Pipeline:
             return
 
         # Phase 4.2: 위험한 Trust Policy 차단
-        if settings.block_wildcard_trust and has_dangerous_trust(trust_policy):
+        if trust_policy and settings.block_wildcard_trust and has_dangerous_trust(trust_policy):
             raise RuntimeError(
                 f'Dangerous trust policy detected for role {buf.role_name} '
                 f'(wildcard principal). '

@@ -49,8 +49,13 @@ DATA_TF = """data "aws_ssoadmin_instances" "current" {}
 # ── 이름 유틸리티 ─────────────────────────────────────────────────────────────
 
 def sanitize_resource_name(name: str) -> str:
-    """Terraform 리소스 식별자용 (소문자, 영숫자+밑줄만)."""
-    return re.sub(r'[^a-zA-Z0-9_]', '_', name).lower()
+    """Terraform 리소스 식별자용 (소문자, 영숫자+밑줄만).
+    Terraform 식별자는 문자 또는 밑줄로 시작해야 하므로
+    숫자로 시작하는 경우 'ps_' 접두사를 붙인다."""
+    cleaned = re.sub(r'[^a-zA-Z0-9_]', '_', name).lower()
+    if cleaned and cleaned[0].isdigit():
+        cleaned = 'ps_' + cleaned
+    return cleaned
 
 
 def make_ps_name(account_id: str, role_name: str) -> str:
