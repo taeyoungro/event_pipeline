@@ -34,6 +34,12 @@ class Settings(BaseSettings):
     tf_state_lock_table: str = 'nty-tf-state-lock'
     tf_plugin_cache_dir: Path = Path('/var/cache/terraform/plugins')
 
+    # Phase 2: 다중 계정 Assignment 태그 컨벤션
+    iic_target_accounts_tag: str = 'iic-target-accounts'
+
+    # Phase 4: 위험한 Trust Policy 차단
+    block_wildcard_trust: bool = True
+
     # 로깅
     log_level: str = 'INFO'
 

@@ -1,0 +1,2 @@
+[console_scripts]
+iam-pipeline-codegen = iam_pipeline.codegen.server:main

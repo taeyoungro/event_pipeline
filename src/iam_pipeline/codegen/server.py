@@ -70,9 +70,11 @@ async def webhook(
 
     return {
         'status': 'accepted',
+        'event_name': info.get('event_name'),
+        'action': info.get('action'),
         'account_id': info['account_id'],
         'role_name': info['role_name'],
-        'policy_arn': info['policy_arn'],
+        'policy_arn': info.get('policy_arn'),   # ATTACH/DETACH만 존재
         'file': saved,
     }
 

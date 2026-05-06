@@ -84,3 +84,25 @@ class TerraformRunner:
             'plan': plan_r.stdout,
             'apply': apply_r.stdout,
         }
+
+    def destroy(self, work_dir: Path, state_key: str, request_id: str) -> dict:
+        """Phase 1.4: DeleteRole — terraform init + destroy -auto-approve"""
+        backend_args = self._backend_args(state_key)
+        logger.info(
+            f'[{request_id}] Destroy backend: s3://{self.state_bucket}/{state_key}'
+        )
+
+        init_r = self._run(
+            work_dir,
+            ['terraform', 'init', '-no-color', *backend_args],
+            'init', request_id,
+        )
+        analyze_provider_cache_usage(init_r.stdout, request_id)
+
+        destroy_r = self._run(
+            work_dir,
+            ['terraform', 'destroy', '-no-color', '-auto-approve'],
+            'destroy', request_id,
+        )
+
+        return {'init': init_r.stdout, 'destroy': destroy_r.stdout}
