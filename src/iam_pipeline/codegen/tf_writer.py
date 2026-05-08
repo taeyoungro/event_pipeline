@@ -2,7 +2,7 @@
 
 주요 변경 (Phase 3.1~3.3):
   - PS 이름: {account_id}-{role_name} 형식, 32자 IIC 제약 검증
-  - role_inline_policies: PutRolePolicy로 부착된 Role 인라인 정책 포함
+  - Customer Managed Policy 본문을 PermissionSet Inline Policy로 통합
   - target_account_ids: 다중 계정 Account Assignment (Phase 2.3)
   - skip_assignment: 서비스 Role에 대해 Assignment 생략 (Phase 4.3)
 """
@@ -80,10 +80,9 @@ def validate_ps_name(name: str) -> None:
 
 def merge_inline_policies(
     customer_documents: list[tuple[str, dict]],
-    role_inline_docs: dict[str, dict],
 ) -> Optional[dict]:
     """
-    Customer Managed Policy 본문 + Role 인라인 정책을 하나로 통합.
+    Customer Managed Policy 본문을 PermissionSet Inline Policy로 통합.
 
     IIC Permission Set은 Sid를 지원하지 않으므로 모든 Sid를 제거한다.
     통합할 문서가 없으면 None 반환.
@@ -91,10 +90,6 @@ def merge_inline_policies(
     merged_statements: list[dict] = []
 
     for _name, doc in customer_documents:
-        for stmt in _iter_statements(doc):
-            merged_statements.append({k: v for k, v in stmt.items() if k != 'Sid'})
-
-    for _name, doc in role_inline_docs.items():
         for stmt in _iter_statements(doc):
             merged_statements.append({k: v for k, v in stmt.items() if k != 'Sid'})
 
@@ -118,20 +113,16 @@ def generate_main_tf(
     fetcher: PolicyFetcher,
     inline_max_chars: int,
     target_account_ids: Optional[list[str]] = None,
-    role_inline_policies: Optional[dict[str, dict]] = None,
     skip_assignment: bool = False,
 ) -> str:
     """
     RoleBuffer → main.tf 콘텐츠.
 
     target_account_ids: None이면 buf.target_account_id 단일 계정.
-    role_inline_policies: PutRolePolicy로 추가된 Role 인라인 정책 문서 {name: doc}.
     skip_assignment: True면 서비스 Role → User/Account Assignment 블록 생략.
     """
     if target_account_ids is None:
         target_account_ids = [buf.target_account_id] if buf.target_account_id else []
-    if role_inline_policies is None:
-        role_inline_policies = {}
 
     # Phase 3.1/3.2: PS 이름 결정
     ps_name = make_ps_name(buf.account_id, buf.role_name)
@@ -160,8 +151,8 @@ def generate_main_tf(
             doc = fetcher.get_customer_policy_document(buf.account_id, policy_arn)
             customer_documents.append((policy_arn_to_name(policy_arn), doc))
 
-    # 인라인 정책 통합 (Customer Managed + Role 인라인)
-    inline_doc = merge_inline_policies(customer_documents, role_inline_policies)
+    # Customer Managed Policy → PermissionSet Inline Policy 통합
+    inline_doc = merge_inline_policies(customer_documents)
     if inline_doc is not None:
         inline_json = json.dumps(inline_doc, indent=2)
         if len(inline_json) > inline_max_chars:
@@ -178,8 +169,7 @@ def generate_main_tf(
         f"# PS Name: {ps_name}",
         f"# Requester IIC User: {buf.requester_iic_user}",
         f"# AWS Managed: {len(aws_managed)}, "
-        f"Customer Managed (inline): {len(customer_managed)}, "
-        f"Role Inline: {len(role_inline_policies)}",
+        f"Customer Managed (inline): {len(customer_managed)}",
         "",
         f'resource "aws_ssoadmin_permission_set" "{resource_name}" {{',
         f'  name             = "{ps_name}"',
@@ -271,7 +261,6 @@ def write_workspace(
     fetcher: PolicyFetcher,
     inline_max_chars: int,
     target_account_ids: Optional[list[str]] = None,
-    role_inline_policies: Optional[dict[str, dict]] = None,
     skip_assignment: bool = False,
 ) -> Path:
     """RoleBuffer를 디스크에 워크스페이스로 저장. 저장된 디렉터리 반환."""
@@ -283,7 +272,6 @@ def write_workspace(
         fetcher,
         inline_max_chars,
         target_account_ids=target_account_ids,
-        role_inline_policies=role_inline_policies,
         skip_assignment=skip_assignment,
     )
 
@@ -309,7 +297,6 @@ def write_workspace(
         'customer_managed_policies': sorted(
             p for p in buf.policy_arns if not is_aws_managed_policy(p)
         ),
-        'role_inline_policy_names': sorted((role_inline_policies or {}).keys()),
         'first_event_at': buf.first_event_at.isoformat() if buf.first_event_at else None,
         'last_event_at': buf.last_event_at.isoformat() if buf.last_event_at else None,
         'processed_at': datetime.now(timezone.utc).isoformat(),

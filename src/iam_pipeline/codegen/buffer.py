@@ -2,14 +2,21 @@
 
 BufferAction:
   ATTACH  — AttachRolePolicy 이벤트 누적 → PS 생성/갱신
-  REFRESH — DetachRolePolicy/PutRolePolicy 수신 → IAM에서 현재 상태를 새로 읽어 PS 갱신
+  REFRESH — DetachRolePolicy 수신 → IAM에서 현재 상태를 새로 읽어 PS 갱신
   DELETE  — DeleteRole 수신 → PS 파괴 (terraform destroy)
 
 액션 우선순위: ATTACH < REFRESH < DELETE (절대 다운그레이드 없음)
-DELETE는 debounce를 1초로 단축하여 신속 처리한다.
+
+DeleteRole/DetachRolePolicy 레이스 처리:
+  - DeleteRole 수신 시 _pending_deletes에 TTL과 함께 기록한다.
+  - 이후 동일 Role의 DetachRolePolicy(REFRESH)가 도착하면 _pending_deletes를 확인하여
+    DeleteRole 흐름의 일부임을 인식하고 해당 이벤트를 무시한다.
+  - 모든 이벤트는 동일 debounce_seconds를 사용하므로, DeleteRole이 먼저 수신된 경우에도
+    debounce 윈도우 내에서 도착하는 DetachRolePolicy가 기존 DELETE 버퍼에 흡수된다.
 """
 import asyncio
 import logging
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
@@ -19,7 +26,10 @@ from .policy_utils import policy_arn_to_name
 
 logger = logging.getLogger(__name__)
 
-_DELETE_DEBOUNCE = 1.0   # DELETE 이벤트 전용 단축 debounce (초)
+# DeleteRole 수신 후 DetachRolePolicy를 무시할 시간.
+# debounce_seconds보다 충분히 길게 설정하여 debounce 만료 후 늦게 도착하는
+# DetachRolePolicy도 차단한다.
+_PENDING_DELETE_TTL = 30.0
 
 
 class BufferAction(Enum):
@@ -59,14 +69,36 @@ class BufferManager:
         self._lock = asyncio.Lock()
         self._debounce_seconds = debounce_seconds
         self._on_process = on_process
+        # (account_id, role_name) → pending delete 만료 시각 (monotonic)
+        self._pending_deletes: dict[tuple[str, str], float] = {}
 
     async def upsert_event(self, info: dict) -> None:
         key = (info['account_id'], info['role_name'])
         new_action = BufferAction(info.get('action', 'ATTACH'))
 
         async with self._lock:
-            buf = self._buffers.get(key)
             now = datetime.now(timezone.utc)
+            now_mono = time.monotonic()
+
+            # REFRESH(DetachRolePolicy): pending delete가 있으면 Role 삭제 흐름의
+            # 일부이므로 이벤트를 무시한다.
+            if new_action == BufferAction.REFRESH:
+                expiry = self._pending_deletes.get(key)
+                if expiry is not None and now_mono < expiry:
+                    logger.info(
+                        f"REFRESH ignored — DeleteRole already pending: "
+                        f"({info['account_id']}, {info['role_name']})"
+                    )
+                    return
+
+            # DELETE 수신: 이후 도착하는 REFRESH 차단을 위해 pending delete 기록
+            if new_action == BufferAction.DELETE:
+                self._pending_deletes[key] = now_mono + _PENDING_DELETE_TTL
+                logger.debug(
+                    f"Pending delete recorded: {key} (TTL={_PENDING_DELETE_TTL}s)"
+                )
+
+            buf = self._buffers.get(key)
 
             if buf is None:
                 buf = RoleBuffer(
@@ -100,13 +132,8 @@ class BufferManager:
 
             buf.last_event_at = now
 
-            debounce = (
-                _DELETE_DEBOUNCE
-                if buf.action == BufferAction.DELETE
-                else self._debounce_seconds
-            )
             buf.timer_task = asyncio.create_task(
-                self._wait_then_process(key, debounce)
+                self._wait_then_process(key, self._debounce_seconds)
             )
 
             _extra = ''

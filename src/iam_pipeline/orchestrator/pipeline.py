@@ -1,6 +1,6 @@
 """codegen 처리 완료 → executor 호출 흐름
 
-Phase 1.3/1.4/1.5: BufferAction에 따라 ATTACH/REFRESH/DELETE 분기
+Phase 1.3/1.4: BufferAction에 따라 ATTACH/REFRESH/DELETE 분기
 Phase 2.2/2.3/2.5: iic-target-accounts 태그 파싱 → 다중 계정 Assignment
 Phase 4.1/4.2/4.3: Trust Policy 분석 (서비스 Role 감지, 위험 패턴 차단)
 Phase 5.1: 처리 실패 분류 (FailureCategory enum)
@@ -219,17 +219,6 @@ class Pipeline:
                 'Set block_wildcard_trust=false to override.'
             )
 
-        # Phase 1.5: Role 인라인 정책 조회 (PutRolePolicy / REFRESH)
-        try:
-            role_inline_policies = fetcher.get_inline_policies(
-                buf.account_id, buf.role_name
-            )
-        except RuntimeError as e:
-            logger.warning(
-                f'[{request_id}] Inline policy fetch failed (proceeding without): {e}'
-            )
-            role_inline_policies = {}
-
         # Phase 2.2: 태그에서 대상 계정 파싱
         tags = fetcher.get_role_tags(buf.account_id, buf.role_name)
         target_account_ids = parse_target_accounts(
@@ -261,7 +250,6 @@ class Pipeline:
             fetcher=fetcher,
             inline_max_chars=settings.inline_policy_max_chars,
             target_account_ids=target_account_ids,
-            role_inline_policies=role_inline_policies,
             skip_assignment=skip_assignment,
         )
         logger.info(f'[{request_id}] Workspace written: {source_dir}')
@@ -280,22 +268,57 @@ class Pipeline:
         finally:
             cleanup_work_dir(work_dir, request_id)
 
+    def _state_exists(self, buf: RoleBuffer, request_id: str) -> bool:
+        """
+        S3 Terraform state 파일 존재 여부로 파이프라인 관리 대상 확인 (1회 API 호출).
+        API 오류 시 fail-open(True)으로 처리하여 terraform destroy를 시도한다.
+        """
+        state_key = self._state_key(buf)
+        try:
+            s3 = boto3.client('s3', region_name=settings.tf_state_region)
+            s3.head_object(Bucket=settings.tf_state_bucket, Key=state_key)
+            logger.info(f'[{request_id}] State file found: {state_key}')
+            return True
+        except ClientError as e:
+            code = e.response['Error']['Code']
+            if code in ('404', 'NoSuchKey'):
+                logger.info(
+                    f'[{request_id}] State file not found: {state_key}'
+                )
+                return False
+            logger.warning(
+                f'[{request_id}] State file check failed (fail-open): {e}'
+            )
+            return True
+
     async def _process_delete(
         self,
         buf: RoleBuffer,
         request_id: str,
     ) -> None:
-        """Phase 1.4: DeleteRole → terraform destroy"""
+        """Phase 1.4: DeleteRole → S3 state 파일 확인 후 terraform destroy"""
+        state_key = self._state_key(buf)
         logger.info(
-            f'[{request_id}] DELETE: destroying Permission Set '
-            f'for role {buf.role_name}'
+            f'[{request_id}] DELETE: checking state file for '
+            f'role={buf.role_name} → key={state_key}'
+        )
+
+        if not self._state_exists(buf, request_id):
+            logger.info(
+                f'[{request_id}] === Pipeline skipped '
+                f'(no state file: {state_key}) ==='
+            )
+            return
+
+        logger.info(
+            f'[{request_id}] DELETE: destroying PermissionSet for role {buf.role_name}'
         )
         source_dir = write_destroy_workspace(buf, self.output_base)
         work_dir = prepare_work_dir(source_dir, self.work_base, request_id)
         try:
             self.runner.destroy(
                 work_dir=work_dir,
-                state_key=self._state_key(buf),
+                state_key=state_key,
                 request_id=request_id,
             )
             logger.info(f'[{request_id}] === Pipeline destroy succeeded ===')

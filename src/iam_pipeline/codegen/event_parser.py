@@ -3,16 +3,14 @@
 지원 이벤트:
   AttachRolePolicy  → action='ATTACH'   (policy_arn 포함)
   DetachRolePolicy  → action='REFRESH'  (policy_arn 포함)
-  PutRolePolicy     → action='REFRESH'  (policy_name 포함)
   DeleteRole        → action='DELETE'
 """
 from typing import Optional
 
-# Phase 1.3/1.4/1.5: 지원 이벤트 목록
+# 지원 이벤트 목록 — Inline Policy(PutRolePolicy)는 PermissionSet에 반영하지 않음
 SUPPORTED_EVENTS = {
     'AttachRolePolicy',
     'DetachRolePolicy',
-    'PutRolePolicy',
     'DeleteRole',
 }
 
@@ -27,7 +25,6 @@ _SKIP_ROLE_PREFIXES = (
 _EVENT_TO_ACTION = {
     'AttachRolePolicy': 'ATTACH',
     'DetachRolePolicy': 'REFRESH',
-    'PutRolePolicy':    'REFRESH',
     'DeleteRole':       'DELETE',
 }
 
@@ -80,12 +77,6 @@ def extract_event_info(data: dict) -> dict:
         if not policy_arn:
             raise ValueError(f"Missing policyArn for {event_name}")
         result['policy_arn'] = policy_arn
-
-    elif event_name == 'PutRolePolicy':
-        policy_name = req_params.get('policyName')
-        if not policy_name:
-            raise ValueError("Missing policyName for PutRolePolicy")
-        result['policy_name'] = policy_name
 
     # DeleteRole: roleName만으로 충분
 
