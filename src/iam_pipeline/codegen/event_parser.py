@@ -30,10 +30,18 @@ _EVENT_TO_ACTION = {
 
 
 def extract_iic_user(arn: str) -> Optional[str]:
+    """
+    AssumedRole ARN에서 IIC 사용자명 추출.
+    역할 이름이 AWSReservedSSO_ 로 시작하는 경우에만 세션명(사용자명)을 반환.
+    IIC 세션이 아니면 None.
+    """
     if not arn:
         return None
     parts = arn.split('/')
     if len(parts) < 3:
+        return None
+    role_name = parts[-2]
+    if not role_name.startswith('AWSReservedSSO_'):
         return None
     return parts[-1]
 
@@ -60,6 +68,20 @@ def extract_event_info(data: dict) -> dict:
         raise ValueError("Missing accountId")
 
     user_identity = detail.get('userIdentity', {})
+
+    # 세션 발급자 ARN에 /aws-service-role/가 포함되면 AWS 서비스가 자동 발생시킨 이벤트
+    # (StackSets, Config, 기타 AWS 서비스 자동화) → 파이프라인 처리 대상 아님
+    session_issuer_arn = (
+        user_identity
+        .get('sessionContext', {})
+        .get('sessionIssuer', {})
+        .get('arn', '')
+    )
+    if '/aws-service-role/' in session_issuer_arn:
+        raise ValueError(
+            f"Skipping service-invoked event: sessionIssuer={session_issuer_arn}"
+        )
+
     iic_user = extract_iic_user(user_identity.get('arn', ''))
 
     result: dict = {

@@ -113,13 +113,11 @@ def generate_main_tf(
     fetcher: PolicyFetcher,
     inline_max_chars: int,
     target_account_ids: Optional[list[str]] = None,
-    skip_assignment: bool = False,
 ) -> str:
     """
     RoleBuffer → main.tf 콘텐츠.
 
     target_account_ids: None이면 buf.target_account_id 단일 계정.
-    skip_assignment: True면 서비스 Role → User/Account Assignment 블록 생략.
     """
     if target_account_ids is None:
         target_account_ids = [buf.target_account_id] if buf.target_account_id else []
@@ -216,7 +214,7 @@ def generate_main_tf(
         ]
 
     # Phase 2.3: User data + 다중 계정 Account Assignment
-    if buf.requester_iic_user and not skip_assignment and target_account_ids:
+    if buf.requester_iic_user and target_account_ids:
         depends_block = ',\n'.join(attachment_deps) if attachment_deps else ''
 
         parts += [
@@ -261,7 +259,6 @@ def write_workspace(
     fetcher: PolicyFetcher,
     inline_max_chars: int,
     target_account_ids: Optional[list[str]] = None,
-    skip_assignment: bool = False,
 ) -> Path:
     """RoleBuffer를 디스크에 워크스페이스로 저장. 저장된 디렉터리 반환."""
     out_dir = output_base / buf.account_id / buf.role_name
@@ -272,7 +269,6 @@ def write_workspace(
         fetcher,
         inline_max_chars,
         target_account_ids=target_account_ids,
-        skip_assignment=skip_assignment,
     )
 
     files = {

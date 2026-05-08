@@ -89,41 +89,6 @@ def parse_target_accounts(
 
 # ── 파이프라인 ────────────────────────────────────────────────────────────────
 
-def _check_iic_user_exists(username: str) -> bool:
-    """
-    IIC Identity Store에서 사용자 존재 여부를 사전 확인.
-    확인 불가(권한 부족 등)이면 True를 반환하여 TF 시도를 계속한다.
-    """
-    try:
-        sso = boto3.client('sso-admin', region_name=settings.aws_region)
-        instances = sso.list_instances()
-        if not instances.get('Instances'):
-            logger.warning('SSO 인스턴스를 찾을 수 없어 사용자 검증 생략')
-            return True
-        identity_store_id = instances['Instances'][0]['IdentityStoreId']
-    except ClientError as e:
-        logger.warning(f'SSO 인스턴스 조회 실패, 사용자 검증 생략: {e}')
-        return True
-
-    try:
-        id_store = boto3.client('identitystore', region_name=settings.aws_region)
-        id_store.get_user_id(
-            IdentityStoreId=identity_store_id,
-            AlternateIdentifier={
-                'UniqueAttribute': {
-                    'AttributePath': 'UserName',
-                    'AttributeValue': username,
-                }
-            },
-        )
-        return True
-    except id_store.exceptions.ResourceNotFoundException:
-        logger.info(f'IIC에 사용자 없음 — Account Assignment 생략: {username!r}')
-        return False
-    except ClientError as e:
-        logger.warning(f'사용자 존재 확인 실패, 검증 생략: {e}')
-        return True
-
 
 class Pipeline:
     """코드 생성 → 실행 통합 파이프라인"""
@@ -232,18 +197,13 @@ class Pipeline:
             f'[{request_id}] Target accounts: {target_account_ids}'
         )
 
-        # IIC 사용자 존재 여부 사전 검증 — 없으면 Assignment 블록 생략
-        skip_assignment = False
-        if buf.requester_iic_user:
-            if not _check_iic_user_exists(buf.requester_iic_user):
-                skip_assignment = True
-                logger.info(
-                    f'[{request_id}] requester_iic_user={buf.requester_iic_user!r} '
-                    f'not in IIC — skip_assignment=True'
-                )
-        else:
-            skip_assignment = True
-            logger.info(f'[{request_id}] requester_iic_user=None — skip_assignment=True')
+        # IIC 사용자 검증 — ARN 기반 판단 (AWSReservedSSO_ 역할 세션이 아니면 None)
+        if not buf.requester_iic_user:
+            logger.error(
+                f'[{request_id}] === Pipeline skipped: '
+                f'IIC user not identified (not an AWSReservedSSO_ session) ==='
+            )
+            return
 
         # Codegen: TF 워크스페이스 생성
         source_dir = write_workspace(
@@ -252,7 +212,6 @@ class Pipeline:
             fetcher=fetcher,
             inline_max_chars=settings.inline_policy_max_chars,
             target_account_ids=target_account_ids,
-            skip_assignment=skip_assignment,
         )
         logger.info(f'[{request_id}] Workspace written: {source_dir}')
 
@@ -324,6 +283,7 @@ class Pipeline:
                 request_id=request_id,
             )
             logger.info(f'[{request_id}] === Pipeline destroy succeeded ===')
+            self._delete_state_file(state_key, request_id)
         except Exception as e:
             logger.error(
                 f'[{request_id}] === Pipeline destroy failed: '
@@ -332,3 +292,14 @@ class Pipeline:
             )
         finally:
             cleanup_work_dir(work_dir, request_id)
+
+    def _delete_state_file(self, state_key: str, request_id: str) -> None:
+        """terraform destroy 성공 후 S3 state 파일 제거."""
+        try:
+            s3 = boto3.client('s3', region_name=settings.tf_state_region)
+            s3.delete_object(Bucket=settings.tf_state_bucket, Key=state_key)
+            logger.info(f'[{request_id}] State file deleted: {state_key}')
+        except ClientError as e:
+            logger.warning(
+                f'[{request_id}] State file deletion failed (non-critical): {e}'
+            )
