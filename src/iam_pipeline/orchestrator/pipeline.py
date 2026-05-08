@@ -183,15 +183,17 @@ class Pipeline:
     ) -> None:
         """ATTACH / REFRESH → PS 생성·갱신"""
 
-        # Phase 1.3/1.5: REFRESH 모드 — IAM에서 현재 상태 읽어오기
-        if buf.action == BufferAction.REFRESH:
-            logger.info(
-                f'[{request_id}] REFRESH: fetching current role state from IAM'
-            )
-            current_policies = fetcher.get_attached_policies(
-                buf.account_id, buf.role_name
-            )
-            buf.policy_arns = set(current_policies)
+        # 액션과 무관하게 항상 IAM 현재 상태로 policy_arns 교체.
+        # 버퍼 누적값은 현재 debounce 윈도우 내 이벤트만 포함하므로,
+        # 이전 윈도우에서 부착된 Policy가 누락 → Inline Policy 삭제로 이어지는 문제를 방지.
+        logger.info(
+            f'[{request_id}] Fetching current attached policies from IAM '
+            f'(action={buf.action.value})'
+        )
+        current_policies = fetcher.get_attached_policies(
+            buf.account_id, buf.role_name
+        )
+        buf.policy_arns = set(current_policies)
 
         # Phase 4.1: Trust Policy 조회
         try:

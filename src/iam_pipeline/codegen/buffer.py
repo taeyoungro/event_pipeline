@@ -126,7 +126,7 @@ class BufferManager:
                     )
                     buf.action = new_action
 
-            # ATTACH 이벤트만 policy_arns 누적
+            # ATTACH 이벤트만 policy_arns 누적 (버퍼 상태 조회용 — 실제 TF 생성은 IAM 현재 상태 기준)
             if new_action == BufferAction.ATTACH and 'policy_arn' in info:
                 buf.policy_arns.add(info['policy_arn'])
 
