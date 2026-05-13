@@ -35,7 +35,12 @@ jobs:
             
             # 2. GitHub Secrets에 저장된 내용으로 .env 파일 생성
             echo "${{ secrets.ENV_FILE }}" > .env
-            
+
+            # 2-1. Bedrock RAG 관련 값은 별도 Secret으로 관리되므로 .env에 추가 주입
+            #      (pydantic-settings는 대소문자 무관, 같은 키가 중복되면 마지막 값이 우선)
+            echo "BEDROCK_KNOWLEDGE_BASE_ID=${{ secrets.BEDROCK_KNOWLEDGE_BASE_ID }}" >> .env
+            echo "BEDROCK_MODEL_ID=${{ secrets.BEDROCK_MODEL_ID }}" >> .env
+
             # 3. 중요 보안 조치: 소유자(ec2-user)만 읽고 쓸 수 있도록 권한 강제 설정
             chmod 600 .env
             
