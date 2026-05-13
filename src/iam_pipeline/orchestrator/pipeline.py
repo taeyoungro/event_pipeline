@@ -5,8 +5,10 @@ Phase 2.2/2.3/2.5: iic-target-accounts 태그 파싱 → 다중 계정 Assignmen
 Phase 4.1/4.2/4.3: Trust Policy 분석 (서비스 Role 감지, 위험 패턴 차단)
 Phase 5.1: 처리 실패 분류 (FailureCategory enum)
 """
+import asyncio
 import logging
 import re
+import sys
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
@@ -276,6 +278,22 @@ class Pipeline:
                     )
                     raise
 
+            # 관리자 최종 승인 게이트:
+            # RAG 검증 통과 후, terraform plan 결과(실제 변경 내역)와 함께
+            # 관리자가 Y/N으로 최종 승인해야 apply가 실행된다.
+            approved = await self._prompt_admin_approval(
+                buf=buf,
+                target_account_ids=target_account_ids,
+                plan_output=plan_output,
+                request_id=request_id,
+            )
+            if not approved:
+                logger.warning(
+                    f'[{request_id}] === Pipeline aborted by admin '
+                    f'(role={buf.role_name}, account={buf.account_id}) ==='
+                )
+                return
+
             # 검증 통과 시 apply 실행
             logger.info(f'[{request_id}] Applying terraform plan')
             self.runner.apply_plan(
@@ -287,6 +305,61 @@ class Pipeline:
             raise
         finally:
             cleanup_work_dir(work_dir, request_id)
+
+    async def _prompt_admin_approval(
+        self,
+        buf: RoleBuffer,
+        target_account_ids: list[str],
+        plan_output: str,
+        request_id: str,
+    ) -> bool:
+        """터미널에서 관리자에게 최종 승인(Y/N)을 받아 apply 여부를 결정한다.
+
+        - 표시 정보: 요청자, 소스 계정, 대상 계정, Role, 정책 ARN 목록, terraform plan 요약
+        - 'Y' 또는 'y'만 승인으로 간주, 그 외 입력 및 EOF/비대화형 stdin은 거부로 처리한다.
+        - input()은 블로킹이므로 asyncio.to_thread로 실행해 이벤트 루프를 점유하지 않는다.
+        """
+        plan_tail = plan_output[-3000:] if len(plan_output) > 3000 else plan_output
+
+        banner = (
+            '\n' + '=' * 70 + '\n'
+            f'[ADMIN APPROVAL REQUIRED] request_id={request_id}\n'
+            + '=' * 70 + '\n'
+            f'  Requester (IIC user) : {buf.requester_iic_user}\n'
+            f'  Source account       : {buf.account_id}\n'
+            f'  Target accounts      : {", ".join(target_account_ids)}\n'
+            f'  IAM Role             : {buf.role_name}\n'
+            f'  Action               : {buf.action.value}\n'
+            f'  Policy ARNs ({len(buf.policy_arns)}):\n'
+            + ''.join(f'    - {arn}\n' for arn in sorted(buf.policy_arns))
+            + '-' * 70 + '\n'
+            '  Terraform plan (tail):\n'
+            f'{plan_tail}\n'
+            + '=' * 70 + '\n'
+            'Apply this plan and create/update the IIC PermissionSet? [y/N]: '
+        )
+
+        logger.info(f'[{request_id}] Waiting for admin approval (terminal)')
+
+        if not sys.stdin or not sys.stdin.isatty():
+            logger.error(
+                f'[{request_id}] Admin approval required but stdin is not a TTY — denying'
+            )
+            return False
+
+        def _ask() -> str:
+            try:
+                return input(banner)
+            except EOFError:
+                return ''
+
+        answer = (await asyncio.to_thread(_ask)).strip().lower()
+        approved = answer == 'y'
+        logger.info(
+            f'[{request_id}] Admin approval result: '
+            f'{"APPROVED" if approved else "DENIED"} (input={answer!r})'
+        )
+        return approved
 
     def _state_exists(self, buf: RoleBuffer, request_id: str) -> bool:
         """
