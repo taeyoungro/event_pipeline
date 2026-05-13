@@ -111,6 +111,7 @@ class BedrockRAGValidator:
         policy_arns: set[str],
         target_account_ids: list[str],
         terraform_plan: Optional[str] = None,
+        inline_policy_docs: Optional[dict[str, dict]] = None,
     ) -> dict:
         """
         RAG를 통한 최소권한 검증:
@@ -120,6 +121,9 @@ class BedrockRAGValidator:
 
         Args:
             terraform_plan: terraform plan 명령 출력 (선택사항)
+            inline_policy_docs: CMP ARN → policy document 매핑.
+                기존 PS에 새롭게 추가된 CMP의 실제 권한 내용을 RAG에 전달할 때 사용.
+                ARN만으로는 내용을 알 수 없는 Customer Managed Policy에 한해 제공.
 
         Returns:
             {
@@ -153,6 +157,7 @@ class BedrockRAGValidator:
             policy_arns,
             project_validation.get("project_name", ""),
             terraform_plan=terraform_plan,
+            inline_policy_docs=inline_policy_docs,
         )
 
         if policies_validation["has_unnecessary_policies"]:
@@ -241,12 +246,16 @@ class BedrockRAGValidator:
         policy_arns: set[str],
         project_name: str,
         terraform_plan: Optional[str] = None,
+        inline_policy_docs: Optional[dict[str, dict]] = None,
     ) -> dict:
         """요청된 권한이 프로젝트 목적에 맞는지, 최소권한 원칙을 따르는지 검증
 
-        terraform_plan을 포함하면 실제 리소스 변경과 권한 요청의 일치성 검증 가능
+        terraform_plan을 포함하면 실제 리소스 변경과 권한 요청의 일치성 검증 가능.
+        inline_policy_docs를 포함하면 CMP의 실제 권한 내용을 RAG 쿼리에 첨부.
         """
-        policies_str = "\n".join(sorted(policy_arns))
+        # policy_arns(AMP) + inline_policy_docs 키(CMP) 합산으로 응답 schema 구성
+        all_arns = set(policy_arns) | set(inline_policy_docs or {})
+        policies_str = "\n".join(sorted(policy_arns)) if policy_arns else "(none)"
 
         query = (
             f"You are a strict JSON-only API. Evaluate whether each requested IAM "
@@ -257,8 +266,15 @@ class BedrockRAGValidator:
             f"Account: {account_id}\n"
             f"Role: {role_name}\n"
             f"User: {iic_user}\n"
-            f"Requested Policy ARNs:\n{policies_str}\n\n"
+            f"Requested AWS Managed Policy ARNs:\n{policies_str}\n\n"
         )
+
+        if inline_policy_docs:
+            query += "Newly attached Customer Managed Policies (embedded as inline in PS):\n"
+            for arn, doc in sorted(inline_policy_docs.items()):
+                doc_str = json.dumps(doc, indent=2)
+                doc_str = doc_str[:1500] if len(doc_str) > 1500 else doc_str
+                query += f"ARN: {arn}\nDocument:\n{doc_str}\n\n"
 
         if terraform_plan:
             plan_summary = terraform_plan[:2000] if len(terraform_plan) > 2000 else terraform_plan
@@ -313,10 +329,10 @@ class BedrockRAGValidator:
             # 파싱 실패 시 보수적으로 fail-closed: 모든 정책을 불필요로 표시해 승인 흐름으로 이동
             return {
                 "has_unnecessary_policies": True,
-                "unnecessary_policies": sorted(policy_arns),
+                "unnecessary_policies": sorted(all_arns),
                 "policy_details": {
                     arn: {"is_necessary": False, "reason": "RAG response not parseable"}
-                    for arn in policy_arns
+                    for arn in all_arns
                 },
                 "rag_analysis": rag_response,
             }
@@ -329,7 +345,7 @@ class BedrockRAGValidator:
             for item in parsed.get("policies", []) or []
             if isinstance(item, dict)
         }
-        for arn in sorted(policy_arns):
+        for arn in sorted(all_arns):
             item = by_arn.get(arn, {})
             is_necessary = bool(item.get("is_necessary", True))
             confidence = str(item.get("confidence", "low")).lower()
