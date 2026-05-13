@@ -41,8 +41,9 @@ class Settings(BaseSettings):
     block_wildcard_trust: bool = True
 
     # Phase 5.2: Bedrock RAG 최소권한 검증
-    bedrock_knowledge_base_id: str = ''  # Bedrock Knowledge Base ID
-    bedrock_model_id: str = 'anthropic.claude-3-5-sonnet-20241022-v2:0'
+    # 두 값 모두 .env(GitHub Secret 주입)에서 로드 — 코드 내 기본값 없음.
+    bedrock_knowledge_base_id: str = ''
+    bedrock_model_id: str = ''
     bedrock_enable_rag_validation: bool = True
 
     # 로깅

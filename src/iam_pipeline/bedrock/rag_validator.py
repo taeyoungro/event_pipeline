@@ -14,8 +14,16 @@ class BedrockRAGValidator:
     def __init__(
         self,
         knowledge_base_id: str,
-        model_id: str = "anthropic.claude-3-5-sonnet-20241022-v2:0",
+        model_id: str,
     ):
+        if not knowledge_base_id:
+            raise ValueError(
+                "knowledge_base_id is empty — set BEDROCK_KNOWLEDGE_BASE_ID in .env"
+            )
+        if not model_id:
+            raise ValueError(
+                "model_id is empty — set BEDROCK_MODEL_ID in .env"
+            )
         self.knowledge_base_id = knowledge_base_id
         self.model_id = model_id
         self._bedrock = boto3.client("bedrock-agent-runtime")
