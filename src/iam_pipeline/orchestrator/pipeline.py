@@ -6,6 +6,7 @@ Phase 4.1/4.2/4.3: Trust Policy 분석 (서비스 Role 감지, 위험 패턴 차
 Phase 5.1: 처리 실패 분류 (FailureCategory enum)
 """
 import asyncio
+import json
 import logging
 import re
 import sys
@@ -29,6 +30,95 @@ from ..executor.workspace import cleanup_work_dir, prepare_work_dir
 logger = logging.getLogger(__name__)
 
 _ACCOUNT_ID_RE = re.compile(r'^\d{12}$')
+
+
+# ── 관리자 승인 리포트 헬퍼 ──────────────────────────────────────────────────
+
+def _classify_policy_type(arn: str) -> str:
+    """ARN으로부터 AWS Managed / Customer Managed / Inline 구분."""
+    # arn:aws:iam::aws:policy/...        → AWS Managed
+    # arn:aws:iam::<12-digit acct>:policy/... → Customer Managed
+    if ':iam::aws:policy/' in arn:
+        return 'AWS Managed'
+    if re.search(r':iam::\d{12}:policy/', arn):
+        return 'Customer Managed'
+    return 'Unknown'
+
+
+def _policy_name(arn: str) -> str:
+    return arn.rsplit('/', 1)[-1] if '/' in arn else arn
+
+
+_account_name_cache: dict[str, str] = {}
+
+
+def _lookup_account_name(account_id: str) -> str:
+    """Organizations DescribeAccount으로 계정 이름 조회. 실패/권한 부족 시 빈 문자열."""
+    if account_id in _account_name_cache:
+        return _account_name_cache[account_id]
+    name = ''
+    try:
+        org = boto3.client('organizations')
+        name = org.describe_account(AccountId=account_id)['Account'].get('Name', '')
+    except ClientError as e:
+        logger.warning(
+            f'Organizations DescribeAccount({account_id}) failed: '
+            f'{e.response["Error"].get("Code")}'
+        )
+    except Exception as e:
+        logger.warning(f'Account name lookup failed for {account_id}: {e}')
+    _account_name_cache[account_id] = name
+    return name
+
+
+def build_approval_report(
+    iic_user: str,
+    target_account_ids: list[str],
+    policy_details: dict[str, dict],
+) -> str:
+    """관리자에게 보여줄 텍스트 리포트 생성.
+
+    형식:
+      요청자: <IIC user>
+      대상 계정: <id1> / <name1>; <id2> / <name2>
+      요청 권한1: <AWS Managed|Customer Managed>/<권한이름>/<필요 사유>
+      요청 권한2: ...
+    """
+    lines: list[str] = []
+    lines.append(f'요청자: {iic_user or "(unknown)"}')
+
+    target_parts = []
+    for acct in target_account_ids:
+        name = _lookup_account_name(acct) or 'Unknown'
+        target_parts.append(f'{acct} / {name}')
+    lines.append(f'대상 계정: {"; ".join(target_parts) if target_parts else "(none)"}')
+
+    for i, arn in enumerate(sorted(policy_details.keys()), start=1):
+        info = policy_details[arn] or {}
+        ptype = _classify_policy_type(arn)
+        pname = _policy_name(arn)
+        reason = (info.get('reason') or '').strip().replace('\n', ' ')
+        lines.append(f'요청 권한{i}: {ptype}/{pname}/{reason}')
+
+    return '\n'.join(lines) + '\n'
+
+
+def save_approval_report(
+    report: str,
+    policy_details: dict[str, dict],
+    dest_dir: Path,
+    request_id: str,
+) -> Path:
+    """관리자용 리포트(.txt)와 구조화 데이터(.json)를 dest_dir에 저장."""
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    txt_path = dest_dir / f'{request_id}.txt'
+    json_path = dest_dir / f'{request_id}.json'
+    txt_path.write_text(report, encoding='utf-8')
+    json_path.write_text(
+        json.dumps(policy_details, ensure_ascii=False, indent=2),
+        encoding='utf-8',
+    )
+    return txt_path
 
 
 # ── Phase 5.1: 실패 분류 ────────────────────────────────────────────────────
@@ -242,6 +332,7 @@ class Pipeline:
                 request_id=request_id,
             )
 
+            policy_details: dict[str, dict] = {}
             if self.rag_validator:
                 logger.info(
                     f'[{request_id}] Validating least-privilege with Bedrock RAG '
@@ -270,6 +361,7 @@ class Pipeline:
                             f'Least-privilege validation failed: {reason}'
                         )
 
+                    policy_details = validation_result.get("policies_validated", {})
                     logger.info(
                         f'[{request_id}] RAG validation succeeded: '
                         f'{validation_result["reason"]}'
@@ -280,6 +372,31 @@ class Pipeline:
                     )
                     raise
 
+            # RAG 검증기가 없거나 응답에 정책 상세가 빠진 경우의 fallback —
+            # ARN만으로 최소 정보(타입/이름)로 리포트를 구성.
+            for arn in buf.policy_arns:
+                policy_details.setdefault(
+                    arn,
+                    {"is_necessary": True, "confidence": "n/a", "reason": "(RAG analysis unavailable)"},
+                )
+
+            # 관리자 승인 리포트: 사람이 읽기 좋은 텍스트 + 구조화 JSON 저장
+            approval_report = build_approval_report(
+                iic_user=buf.requester_iic_user or '',
+                target_account_ids=target_account_ids,
+                policy_details=policy_details,
+            )
+            try:
+                saved_path = save_approval_report(
+                    report=approval_report,
+                    policy_details=policy_details,
+                    dest_dir=settings.approval_report_dir,
+                    request_id=request_id,
+                )
+                logger.info(f'[{request_id}] Approval report saved: {saved_path}')
+            except OSError as e:
+                logger.warning(f'[{request_id}] Approval report save failed: {e}')
+
             # 관리자 최종 승인 게이트:
             # RAG 검증 통과 후, terraform plan 결과(실제 변경 내역)와 함께
             # 관리자가 Y/N으로 최종 승인해야 apply가 실행된다.
@@ -288,6 +405,7 @@ class Pipeline:
                 target_account_ids=target_account_ids,
                 plan_output=plan_output,
                 request_id=request_id,
+                approval_report=approval_report,
             )
             if not approved:
                 logger.warning(
@@ -314,6 +432,7 @@ class Pipeline:
         target_account_ids: list[str],
         plan_output: str,
         request_id: str,
+        approval_report: str = '',
     ) -> bool:
         """터미널에서 관리자에게 최종 승인(Y/N)을 받아 apply 여부를 결정한다.
 
@@ -327,13 +446,9 @@ class Pipeline:
             '\n' + '=' * 70 + '\n'
             f'[ADMIN APPROVAL REQUIRED] request_id={request_id}\n'
             + '=' * 70 + '\n'
-            f'  Requester (IIC user) : {buf.requester_iic_user}\n'
-            f'  Source account       : {buf.account_id}\n'
-            f'  Target accounts      : {", ".join(target_account_ids)}\n'
-            f'  IAM Role             : {buf.role_name}\n'
+            + (approval_report + '-' * 70 + '\n' if approval_report else '')
+            + f'  IAM Role             : {buf.role_name}\n'
             f'  Action               : {buf.action.value}\n'
-            f'  Policy ARNs ({len(buf.policy_arns)}):\n'
-            + ''.join(f'    - {arn}\n' for arn in sorted(buf.policy_arns))
             + '-' * 70 + '\n'
             '  Terraform plan (tail):\n'
             f'{plan_tail}\n'
