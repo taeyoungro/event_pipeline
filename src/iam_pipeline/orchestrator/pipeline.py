@@ -15,6 +15,7 @@ from typing import Optional
 import boto3
 from botocore.exceptions import ClientError
 
+from ..bedrock.rag_validator import BedrockRAGValidator
 from ..codegen.buffer import BufferAction, RoleBuffer
 from ..codegen.policy_fetcher import PolicyFetcher
 from ..codegen.policy_utils import has_dangerous_trust, is_service_role
@@ -102,6 +103,15 @@ class Pipeline:
         self.output_base = output_base
         self.work_base = work_base
         self.runner = runner
+        self.rag_validator = (
+            BedrockRAGValidator(
+                knowledge_base_id=settings.bedrock_knowledge_base_id,
+                model_id=settings.bedrock_model_id,
+            )
+            if settings.bedrock_enable_rag_validation
+            and settings.bedrock_knowledge_base_id
+            else None
+        )
 
     def _build_request_id(self, buf: RoleBuffer) -> str:
         ts = datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')
@@ -215,12 +225,61 @@ class Pipeline:
         )
         logger.info(f'[{request_id}] Workspace written: {source_dir}')
 
-        # Executor: 임시 작업 디렉터리로 복사 후 실행
+        # Executor: 임시 작업 디렉터리로 복사
         work_dir = prepare_work_dir(source_dir, self.work_base, request_id)
         try:
-            self.runner.execute(
+            # Phase 5.2: Terraform Plan 생성 후 RAG 검증
+            logger.info(
+                f'[{request_id}] Executing terraform plan for validation'
+            )
+            plan_output = self.runner.plan_and_read(
                 work_dir=work_dir,
                 state_key=self._state_key(buf),
+                request_id=request_id,
+            )
+
+            if self.rag_validator:
+                logger.info(
+                    f'[{request_id}] Validating least-privilege with Bedrock RAG '
+                    f'(user={buf.requester_iic_user}, account={buf.account_id})'
+                )
+                try:
+                    validation_result = await self.rag_validator.validate_least_privilege(
+                        account_id=buf.account_id,
+                        role_name=buf.role_name,
+                        iic_user=buf.requester_iic_user,
+                        policy_arns=buf.policy_arns,
+                        target_account_ids=target_account_ids,
+                        terraform_plan=plan_output,
+                    )
+
+                    if not validation_result["approved"]:
+                        reason = validation_result["reason"]
+                        logger.error(
+                            f'[{request_id}] RAG validation failed: {reason}'
+                        )
+                        if validation_result["requires_approval"]:
+                            await self._request_admin_approval(
+                                buf, request_id, reason, validation_result
+                            )
+                        raise RuntimeError(
+                            f'Least-privilege validation failed: {reason}'
+                        )
+
+                    logger.info(
+                        f'[{request_id}] RAG validation succeeded: '
+                        f'{validation_result["reason"]}'
+                    )
+                except RuntimeError as e:
+                    logger.error(
+                        f'[{request_id}] RAG validation error: {e}'
+                    )
+                    raise
+
+            # 검증 통과 시 apply 실행
+            logger.info(f'[{request_id}] Applying terraform plan')
+            self.runner.apply_plan(
+                work_dir=work_dir,
                 request_id=request_id,
             )
             logger.info(f'[{request_id}] === Pipeline succeeded ===')

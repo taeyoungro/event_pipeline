@@ -85,6 +85,37 @@ class TerraformRunner:
             'apply': apply_r.stdout,
         }
 
+    def plan_and_read(self, work_dir: Path, state_key: str, request_id: str) -> str:
+        """terraform init → plan 실행 후 plan 결과 반환 (apply는 미실행)"""
+        backend_args = self._backend_args(state_key)
+        logger.info(f'[{request_id}] Backend: s3://{self.state_bucket}/{state_key}')
+
+        init_r = self._run(
+            work_dir,
+            ['terraform', 'init', '-no-color', *backend_args],
+            'init', request_id
+        )
+        analyze_provider_cache_usage(init_r.stdout, request_id)
+
+        plan_r = self._run(
+            work_dir,
+            ['terraform', 'plan', '-no-color', '-out=tfplan'],
+            'plan', request_id
+        )
+
+        logger.info(f'[{request_id}] Plan output generated for validation')
+        return plan_r.stdout
+
+    def apply_plan(self, work_dir: Path, request_id: str) -> str:
+        """이미 생성된 tfplan을 apply 실행"""
+        apply_r = self._run(
+            work_dir,
+            ['terraform', 'apply', '-no-color', '-auto-approve', 'tfplan'],
+            'apply', request_id
+        )
+        logger.info(f'[{request_id}] Apply completed with pre-generated plan')
+        return apply_r.stdout
+
     def destroy(self, work_dir: Path, state_key: str, request_id: str) -> dict:
         """Phase 1.4: DeleteRole — terraform init + destroy -auto-approve"""
         backend_args = self._backend_args(state_key)

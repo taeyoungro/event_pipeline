@@ -40,6 +40,11 @@ class Settings(BaseSettings):
     # Phase 4: 위험한 Trust Policy 차단
     block_wildcard_trust: bool = True
 
+    # Phase 5.2: Bedrock RAG 최소권한 검증
+    bedrock_knowledge_base_id: str = ''  # Bedrock Knowledge Base ID
+    bedrock_model_id: str = 'anthropic.claude-3-5-sonnet-20241022-v2:0'
+    bedrock_enable_rag_validation: bool = True
+
     # 로깅
     log_level: str = 'INFO'
 
