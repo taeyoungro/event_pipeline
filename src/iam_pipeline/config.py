@@ -44,6 +44,7 @@ class Settings(BaseSettings):
     # 두 값 모두 .env(GitHub Secret 주입)에서 로드 — 코드 내 기본값 없음.
     bedrock_knowledge_base_id: str = ''
     bedrock_model_id: str = ''
+    bedrock_region: str = 'us-east-1'
     bedrock_enable_rag_validation: bool = True
 
     # 로깅
