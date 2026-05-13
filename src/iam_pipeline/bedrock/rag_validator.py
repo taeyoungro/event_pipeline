@@ -268,6 +268,25 @@ class BedrockRAGValidator:
             )
 
         query += (
+            f"Evaluation rules — apply STRICTLY before marking a policy as unnecessary:\n"
+            f"1. A managed policy is NECESSARY if the service it grants access to is "
+            f"mentioned, implied, or required for any task in the project documentation, "
+            f"including services listed in budgets/cost tables and architecture diagrams.\n"
+            f"2. Read-only / Audit / SecurityAudit / *_ReadOnlyAccess style managed "
+            f"policies are LOW RISK; mark them necessary if the corresponding service "
+            f"is referenced anywhere in the docs (including service names inside tables).\n"
+            f"3. A policy is necessary even when not named explicitly when stated "
+            f"operations cannot be performed without it. Example: 'disable compromised "
+            f"IAM credentials' requires IAM permissions; 'monitor abnormal API calls' "
+            f"implies CloudTrail; 'detect malicious traffic' implies GuardDuty; "
+            f"'security findings aggregation' implies Security Hub.\n"
+            f"4. Phrases like 'AWSLambda_FullAccess OR an equivalent managed policy' "
+            f"mean variants and sibling read-only/admin policies of the same service "
+            f"should all be considered acceptable.\n"
+            f"5. When unsure, mark is_necessary=true with confidence=\"low\" rather "
+            f"than false. Only mark is_necessary=false when the policy targets a "
+            f"service totally unrelated to the project AND no documented scenario "
+            f"could justify it.\n\n"
             f"Respond with ONLY a single JSON object, no markdown, no commentary, no "
             f"code fences. The 'policies' array must contain one entry per requested "
             f"policy ARN above, with the exact ARN string echoed back. Schema:\n"
@@ -276,7 +295,9 @@ class BedrockRAGValidator:
             f'    {{\n'
             f'      "arn": string,                  // 위 요청 ARN 그대로\n'
             f'      "is_necessary": boolean,\n'
-            f'      "reason": string\n'
+            f'      "confidence": "high" | "medium" | "low",\n'
+            f'      "reason": string,\n'
+            f'      "evidence": string              // 문서에서 근거가 된 구절/표 항목\n'
             f'    }}\n'
             f'  ],\n'
             f'  "summary": string\n'
@@ -301,7 +322,8 @@ class BedrockRAGValidator:
             }
 
         details: dict[str, dict] = {}
-        unnecessary: list[str] = []
+        unnecessary: list[str] = []        # confidence=high인 false만 거부 대상
+        low_confidence_flags: list[str] = []  # 그 외 false는 검토 대상으로만 기록
         by_arn = {
             str(item.get("arn", "")): item
             for item in parsed.get("policies", []) or []
@@ -310,14 +332,31 @@ class BedrockRAGValidator:
         for arn in sorted(policy_arns):
             item = by_arn.get(arn, {})
             is_necessary = bool(item.get("is_necessary", True))
+            confidence = str(item.get("confidence", "low")).lower()
             reason = str(item.get("reason", "Within project scope" if is_necessary else ""))
-            details[arn] = {"is_necessary": is_necessary, "reason": reason}
+            evidence = str(item.get("evidence", ""))
+            details[arn] = {
+                "is_necessary": is_necessary,
+                "confidence": confidence,
+                "reason": reason,
+                "evidence": evidence,
+            }
             if not is_necessary:
-                unnecessary.append(arn)
+                if confidence == "high":
+                    unnecessary.append(arn)
+                else:
+                    # 낮은 확신도의 false는 오탐 가능성이 높으므로 자동 거부하지 않고
+                    # 관리자 검토 단계에서 함께 표시한다.
+                    low_confidence_flags.append(arn)
+                    logger.info(
+                        f"Low-confidence 'unnecessary' verdict ignored for {arn} "
+                        f"(confidence={confidence}, reason={reason!r})"
+                    )
 
         return {
             "has_unnecessary_policies": len(unnecessary) > 0,
             "unnecessary_policies": unnecessary,
+            "low_confidence_flags": low_confidence_flags,
             "policy_details": details,
             "rag_analysis": rag_response,
         }
@@ -340,8 +379,8 @@ class BedrockRAGValidator:
                         "modelArn": self.model_arn,
                         "retrievalConfiguration": {
                             "vectorSearchConfiguration": {
-                                "numberOfResults": 5,
-                                "overrideSearchType": "SEMANTIC",
+                                "numberOfResults": 10,
+                                "overrideSearchType": "HYBRID",
                             }
                         },
                     },
