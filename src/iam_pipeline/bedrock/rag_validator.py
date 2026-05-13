@@ -9,7 +9,8 @@ import boto3
 logger = logging.getLogger(__name__)
 
 # Bedrock이 ```json ... ``` 형태로 감싸 보낼 때 본문만 뽑기 위한 패턴
-_JSON_FENCE_RE = re.compile(r"```(?:json)?\s*(\{.*?\}|\[.*?\])\s*```", re.DOTALL)
+# greedy(.*)로 매칭해 중첩 객체가 있어도 가장 바깥 ``` 까지 포함하도록 함
+_JSON_FENCE_RE = re.compile(r"```(?:json)?\s*(\{.*\}|\[.*\])\s*```", re.DOTALL)
 # 모델이 사전/사후 설명을 붙여도 JSON 객체만 추출하기 위한 fallback 패턴
 _JSON_OBJECT_RE = re.compile(r"\{.*\}", re.DOTALL)
 
@@ -36,7 +37,8 @@ def _parse_json_response(response: str) -> dict:
         except json.JSONDecodeError:
             continue
     raise ValueError(
-        f"Bedrock response is not valid JSON. Raw response:\n{response[:500]}"
+        f"Bedrock response is not valid JSON. Raw response (first 2000 chars):\n"
+        f"{response[:2000]}"
     )
 
 
@@ -323,12 +325,17 @@ class BedrockRAGValidator:
             parsed = _parse_json_response(rag_response)
         except ValueError as e:
             logger.warning(f"Policy validation JSON parse failed: {e}")
-            # 파싱 실패 시 보수적으로 fail-closed: 모든 정책을 불필요로 표시해 승인 흐름으로 이동
+            # 파싱 실패: confidence='low'로 마킹해 _handle_rag_rejection이
+            # 자동 하드 거부하지 않고 관리자 승인으로 위임하도록 한다.
             return {
                 "has_unnecessary_policies": True,
                 "unnecessary_policies": sorted(all_arns),
                 "policy_details": {
-                    arn: {"is_necessary": False, "reason": "RAG response not parseable"}
+                    arn: {
+                        "is_necessary": False,
+                        "confidence": "low",
+                        "reason": "RAG response not parseable",
+                    }
                     for arn in all_arns
                 },
                 "rag_analysis": rag_response,
