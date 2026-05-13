@@ -15,6 +15,7 @@ class BedrockRAGValidator:
         self,
         knowledge_base_id: str,
         model_id: str,
+        region: str = "us-east-1",
     ):
         if not knowledge_base_id:
             raise ValueError(
@@ -24,10 +25,15 @@ class BedrockRAGValidator:
             raise ValueError(
                 "model_id is empty — set BEDROCK_MODEL_ID in .env"
             )
+        if not region:
+            raise ValueError(
+                "region is empty — set BEDROCK_REGION in .env"
+            )
         self.knowledge_base_id = knowledge_base_id
         self.model_id = model_id
-        self._bedrock = boto3.client("bedrock-agent-runtime")
-        self._bedrock_models = boto3.client("bedrock")
+        self.region = region
+        self._bedrock = boto3.client("bedrock-agent-runtime", region_name=region)
+        self._bedrock_models = boto3.client("bedrock", region_name=region)
 
     async def validate_least_privilege(
         self,
@@ -192,7 +198,7 @@ class BedrockRAGValidator:
                     "type": "KNOWLEDGE_BASE",
                     "knowledgeBaseConfiguration": {
                         "knowledgeBaseId": self.knowledge_base_id,
-                        "modelArn": f"arn:aws:bedrock:us-east-1::foundation-model/{self.model_id}",
+                        "modelArn": f"arn:aws:bedrock:{self.region}::foundation-model/{self.model_id}",
                         "retrievalConfiguration": {
                             "vectorSearchConfiguration": {
                                 "numberOfResults": 5,
