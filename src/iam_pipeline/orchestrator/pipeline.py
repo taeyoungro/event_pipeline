@@ -388,21 +388,15 @@ class Pipeline:
                             )
 
                             if not validation_result["approved"]:
-                                reason = validation_result["reason"]
-                                logger.error(
-                                    f'[{request_id}] RAG validation failed: {reason}'
-                                )
-                                if validation_result["requires_approval"]:
-                                    await self._request_admin_approval(
-                                        buf, request_id, reason, validation_result
-                                    )
-                                raise RuntimeError(
-                                    f'Least-privilege validation failed: {reason}'
+                                self._handle_rag_rejection(
+                                    validation_result,
+                                    amp_arns={a for a in buf.policy_arns if is_aws_managed_policy(a)},
+                                    request_id=request_id,
                                 )
 
                             policy_details = validation_result.get("policies_validated", {})
                             logger.info(
-                                f'[{request_id}] RAG validation succeeded: '
+                                f'[{request_id}] RAG validation result: '
                                 f'{validation_result["reason"]}'
                             )
                         except RuntimeError as e:
@@ -466,20 +460,15 @@ class Pipeline:
                                 terraform_plan=plan_output,
                             )
                             if not validation_result["approved"]:
-                                reason = validation_result["reason"]
-                                logger.error(
-                                    f'[{request_id}] RAG validation failed: {reason}'
+                                self._handle_rag_rejection(
+                                    validation_result,
+                                    amp_arns=new_amp_arns,
+                                    request_id=request_id,
                                 )
-                                if validation_result["requires_approval"]:
-                                    await self._request_admin_approval(
-                                        buf, request_id, reason, validation_result
-                                    )
-                                raise RuntimeError(
-                                    f'Least-privilege validation failed: {reason}'
-                                )
+
                             policy_details = validation_result.get("policies_validated", {})
                             logger.info(
-                                f'[{request_id}] RAG validation succeeded: '
+                                f'[{request_id}] RAG validation result: '
                                 f'{validation_result["reason"]}'
                             )
                         except RuntimeError as e:
@@ -556,6 +545,36 @@ class Pipeline:
             raise
         finally:
             cleanup_work_dir(work_dir, request_id)
+
+    def _handle_rag_rejection(
+        self,
+        validation_result: dict,
+        amp_arns: set[str],
+        request_id: str,
+    ) -> None:
+        """RAG 거부 결과를 AMP/CMP 별로 처리.
+
+        AMP가 하나라도 거부되면 RuntimeError로 하드 거부.
+        CMP만 거부된 경우 경고 로그만 남기고 반환 → 호출부에서 관리자 승인 단계로 진행.
+        """
+        policies_validated = validation_result.get("policies_validated", {})
+        amp_failures = [
+            arn for arn, d in policies_validated.items()
+            if not d.get("is_necessary", True) and arn in amp_arns
+        ]
+        reason = validation_result["reason"]
+
+        if amp_failures:
+            logger.error(
+                f'[{request_id}] RAG rejected AMP(s) {amp_failures}: {reason}'
+            )
+            raise RuntimeError(f'Least-privilege validation failed: {reason}')
+
+        # CMP만 거부된 경우: RAG가 문서 컨텍스트 없이 CMP를 평가하기 어려우므로
+        # 관리자 승인 게이트로 위임한다.
+        logger.warning(
+            f'[{request_id}] RAG rejected CMP(s) — delegating to admin approval: {reason}'
+        )
 
     async def _prompt_admin_approval(
         self,
