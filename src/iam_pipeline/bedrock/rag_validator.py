@@ -192,13 +192,18 @@ class BedrockRAGValidator:
         print("=" * 60)
 
         try:
+            model_arn = (
+                self.model_id
+                if self.model_id.startswith("arn:")
+                else f"arn:aws:bedrock:{self.region}::foundation-model/{self.model_id}"
+            )
             response = self._bedrock.retrieve_and_generate(
                 input={"text": query},
                 retrieveAndGenerateConfiguration={
                     "type": "KNOWLEDGE_BASE",
                     "knowledgeBaseConfiguration": {
                         "knowledgeBaseId": self.knowledge_base_id,
-                        "modelArn": f"arn:aws:bedrock:{self.region}::foundation-model/{self.model_id}",
+                        "modelArn": model_arn,
                         "retrievalConfiguration": {
                             "vectorSearchConfiguration": {
                                 "numberOfResults": 5,
