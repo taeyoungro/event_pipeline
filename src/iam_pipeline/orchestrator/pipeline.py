@@ -611,18 +611,22 @@ class Pipeline:
 
         def _ask() -> str:
             # /dev/tty는 stdin/stdout과 무관하게 제어 터미널에 직접 연결된다.
-            # uvicorn이나 systemd가 stdin을 닫거나 점유한 환경에서도 동작.
+            # 'r+' text mode는 seekable 요구로 OSError가 나므로 읽기/쓰기 핸들을 분리.
             try:
-                with open('/dev/tty', 'r+') as tty:
-                    tty.write(banner)
-                    tty.flush()
-                    line = tty.readline()
-                    return line  # readline은 EOF 시 '' 반환
+                tty_out = open('/dev/tty', 'w')
+                tty_in = open('/dev/tty', 'r')
             except OSError as e:
                 logger.error(
                     f'[{request_id}] /dev/tty unavailable ({e}) — denying approval'
                 )
                 return ''
+            try:
+                tty_out.write(banner)
+                tty_out.flush()
+                return tty_in.readline()  # EOF 시 '' 반환
+            finally:
+                tty_in.close()
+                tty_out.close()
 
         answer = (await asyncio.to_thread(_ask)).strip().lower()
         approved = answer == 'y'
