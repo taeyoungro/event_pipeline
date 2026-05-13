@@ -379,8 +379,10 @@ class BedrockRAGValidator:
                         "modelArn": self.model_arn,
                         "retrievalConfiguration": {
                             "vectorSearchConfiguration": {
+                                # 인덱스가 HYBRID를 미지원하므로 SEMANTIC 유지.
+                                # 표/예산 항목까지 끌어오기 위해 결과 수만 늘림.
                                 "numberOfResults": 10,
-                                "overrideSearchType": "HYBRID",
+                                "overrideSearchType": "SEMANTIC",
                             }
                         },
                     },
