@@ -232,7 +232,12 @@ class Pipeline:
                 await self._process_delete(buf, request_id)
                 return
 
-            await self._process_upsert(buf, fetcher, request_id)
+            # AttachRolePolicy(ATTACH): RAG + 관리자 승인 게이트 적용
+            # DetachRolePolicy(REFRESH): 요청자 소유권 검증만, RAG/승인 생략
+            skip_validation = (buf.action == BufferAction.REFRESH)
+            await self._process_upsert(
+                buf, fetcher, request_id, skip_validation=skip_validation
+            )
 
         except Exception as e:
             category = classify_failure(e)
@@ -249,8 +254,14 @@ class Pipeline:
         buf: RoleBuffer,
         fetcher: PolicyFetcher,
         request_id: str,
+        skip_validation: bool = False,
     ) -> None:
-        """ATTACH / REFRESH → PS 생성·갱신"""
+        """ATTACH / REFRESH → PS 생성·갱신
+
+        skip_validation=True (REFRESH/DetachRolePolicy):
+          RAG 검증과 관리자 승인 게이트를 생략하고, 대신 요청자가 해당
+          PermissionSet에 실제로 assign된 USER인지만 확인 후 apply 실행.
+        """
 
         # 액션과 무관하게 항상 IAM 현재 상태로 policy_arns 교체.
         # 버퍼 누적값은 현재 debounce 윈도우 내 이벤트만 포함하므로,
@@ -332,87 +343,101 @@ class Pipeline:
                 request_id=request_id,
             )
 
-            policy_details: dict[str, dict] = {}
-            if self.rag_validator:
+            if skip_validation:
+                # REFRESH(DetachRolePolicy): 요청자 소유권만 확인하고 바로 apply.
+                if not self._verify_requester_owns_ps(buf, request_id):
+                    logger.error(
+                        f'[{request_id}] === Pipeline aborted: requester '
+                        f'{buf.requester_iic_user!r} is not assigned to PS '
+                        f'(account={buf.account_id}, role={buf.role_name}) ==='
+                    )
+                    return
                 logger.info(
-                    f'[{request_id}] Validating least-privilege with Bedrock RAG '
-                    f'(user={buf.requester_iic_user}, account={buf.account_id})'
+                    f'[{request_id}] REFRESH path: ownership verified, '
+                    f'skipping RAG validation and admin approval'
+                )
+            else:
+                policy_details: dict[str, dict] = {}
+                if self.rag_validator:
+                    logger.info(
+                        f'[{request_id}] Validating least-privilege with Bedrock RAG '
+                        f'(user={buf.requester_iic_user}, account={buf.account_id})'
+                    )
+                    try:
+                        validation_result = await self.rag_validator.validate_least_privilege(
+                            account_id=buf.account_id,
+                            role_name=buf.role_name,
+                            iic_user=buf.requester_iic_user,
+                            policy_arns=buf.policy_arns,
+                            target_account_ids=target_account_ids,
+                            terraform_plan=plan_output,
+                        )
+
+                        if not validation_result["approved"]:
+                            reason = validation_result["reason"]
+                            logger.error(
+                                f'[{request_id}] RAG validation failed: {reason}'
+                            )
+                            if validation_result["requires_approval"]:
+                                await self._request_admin_approval(
+                                    buf, request_id, reason, validation_result
+                                )
+                            raise RuntimeError(
+                                f'Least-privilege validation failed: {reason}'
+                            )
+
+                        policy_details = validation_result.get("policies_validated", {})
+                        logger.info(
+                            f'[{request_id}] RAG validation succeeded: '
+                            f'{validation_result["reason"]}'
+                        )
+                    except RuntimeError as e:
+                        logger.error(
+                            f'[{request_id}] RAG validation error: {e}'
+                        )
+                        raise
+
+                # RAG 검증기가 없거나 응답에 정책 상세가 빠진 경우의 fallback —
+                # ARN만으로 최소 정보(타입/이름)로 리포트를 구성.
+                for arn in buf.policy_arns:
+                    policy_details.setdefault(
+                        arn,
+                        {"is_necessary": True, "confidence": "n/a", "reason": "(RAG analysis unavailable)"},
+                    )
+
+                # 관리자 승인 리포트: 사람이 읽기 좋은 텍스트 + 구조화 JSON 저장
+                approval_report = build_approval_report(
+                    iic_user=buf.requester_iic_user or '',
+                    target_account_ids=target_account_ids,
+                    policy_details=policy_details,
                 )
                 try:
-                    validation_result = await self.rag_validator.validate_least_privilege(
-                        account_id=buf.account_id,
-                        role_name=buf.role_name,
-                        iic_user=buf.requester_iic_user,
-                        policy_arns=buf.policy_arns,
-                        target_account_ids=target_account_ids,
-                        terraform_plan=plan_output,
+                    saved_path = save_approval_report(
+                        report=approval_report,
+                        policy_details=policy_details,
+                        dest_dir=settings.approval_report_dir,
+                        request_id=request_id,
                     )
+                    logger.info(f'[{request_id}] Approval report saved: {saved_path}')
+                except OSError as e:
+                    logger.warning(f'[{request_id}] Approval report save failed: {e}')
 
-                    if not validation_result["approved"]:
-                        reason = validation_result["reason"]
-                        logger.error(
-                            f'[{request_id}] RAG validation failed: {reason}'
-                        )
-                        if validation_result["requires_approval"]:
-                            await self._request_admin_approval(
-                                buf, request_id, reason, validation_result
-                            )
-                        raise RuntimeError(
-                            f'Least-privilege validation failed: {reason}'
-                        )
-
-                    policy_details = validation_result.get("policies_validated", {})
-                    logger.info(
-                        f'[{request_id}] RAG validation succeeded: '
-                        f'{validation_result["reason"]}'
-                    )
-                except RuntimeError as e:
-                    logger.error(
-                        f'[{request_id}] RAG validation error: {e}'
-                    )
-                    raise
-
-            # RAG 검증기가 없거나 응답에 정책 상세가 빠진 경우의 fallback —
-            # ARN만으로 최소 정보(타입/이름)로 리포트를 구성.
-            for arn in buf.policy_arns:
-                policy_details.setdefault(
-                    arn,
-                    {"is_necessary": True, "confidence": "n/a", "reason": "(RAG analysis unavailable)"},
-                )
-
-            # 관리자 승인 리포트: 사람이 읽기 좋은 텍스트 + 구조화 JSON 저장
-            approval_report = build_approval_report(
-                iic_user=buf.requester_iic_user or '',
-                target_account_ids=target_account_ids,
-                policy_details=policy_details,
-            )
-            try:
-                saved_path = save_approval_report(
-                    report=approval_report,
-                    policy_details=policy_details,
-                    dest_dir=settings.approval_report_dir,
+                # 관리자 최종 승인 게이트:
+                # RAG 검증 통과 후, terraform plan 결과(실제 변경 내역)와 함께
+                # 관리자가 Y/N으로 최종 승인해야 apply가 실행된다.
+                approved = await self._prompt_admin_approval(
+                    buf=buf,
+                    target_account_ids=target_account_ids,
+                    plan_output=plan_output,
                     request_id=request_id,
+                    approval_report=approval_report,
                 )
-                logger.info(f'[{request_id}] Approval report saved: {saved_path}')
-            except OSError as e:
-                logger.warning(f'[{request_id}] Approval report save failed: {e}')
-
-            # 관리자 최종 승인 게이트:
-            # RAG 검증 통과 후, terraform plan 결과(실제 변경 내역)와 함께
-            # 관리자가 Y/N으로 최종 승인해야 apply가 실행된다.
-            approved = await self._prompt_admin_approval(
-                buf=buf,
-                target_account_ids=target_account_ids,
-                plan_output=plan_output,
-                request_id=request_id,
-                approval_report=approval_report,
-            )
-            if not approved:
-                logger.warning(
-                    f'[{request_id}] === Pipeline aborted by admin '
-                    f'(role={buf.role_name}, account={buf.account_id}) ==='
-                )
-                return
+                if not approved:
+                    logger.warning(
+                        f'[{request_id}] === Pipeline aborted by admin '
+                        f'(role={buf.role_name}, account={buf.account_id}) ==='
+                    )
+                    return
 
             # 검증 통과 시 apply 실행
             logger.info(f'[{request_id}] Applying terraform plan')
@@ -478,6 +503,111 @@ class Pipeline:
         )
         return approved
 
+    def _verify_requester_owns_ps(self, buf: RoleBuffer, request_id: str) -> bool:
+        """buf.requester_iic_user가 해당 Role의 PermissionSet에 USER로 assign되어
+        있는지 IIC SSO + Identity Store API로 확인한다.
+
+        - PS 이름은 codegen과 동일하게 make_ps_name(account_id, role_name)으로 도출.
+        - PS가 존재하지 않으면 False (관리 대상 아님).
+        - 요청자가 비어 있으면 False.
+        """
+        from ..codegen.tf_writer import make_ps_name
+
+        if not buf.requester_iic_user:
+            logger.error(f'[{request_id}] Requester IIC user not identified')
+            return False
+
+        ps_name = make_ps_name(buf.account_id, buf.role_name)
+        region = settings.aws_region
+
+        try:
+            sso = boto3.client('sso-admin', region_name=region)
+            idstore = boto3.client('identitystore', region_name=region)
+
+            instances = sso.list_instances().get('Instances', [])
+            if not instances:
+                logger.error(f'[{request_id}] No IIC instance found in {region}')
+                return False
+            instance_arn = instances[0]['InstanceArn']
+            identity_store_id = instances[0]['IdentityStoreId']
+
+            ps_arn: Optional[str] = None
+            paginator = sso.get_paginator('list_permission_sets')
+            for page in paginator.paginate(InstanceArn=instance_arn):
+                for arn in page.get('PermissionSets', []):
+                    desc = sso.describe_permission_set(
+                        InstanceArn=instance_arn, PermissionSetArn=arn,
+                    )
+                    if desc['PermissionSet'].get('Name') == ps_name:
+                        ps_arn = arn
+                        break
+                if ps_arn:
+                    break
+
+            if not ps_arn:
+                logger.warning(
+                    f'[{request_id}] PermissionSet {ps_name!r} not found in IIC'
+                )
+                return False
+
+            assigned_accounts: list[str] = []
+            p = sso.get_paginator('list_accounts_for_provisioned_permission_set')
+            for page in p.paginate(
+                InstanceArn=instance_arn, PermissionSetArn=ps_arn,
+            ):
+                assigned_accounts.extend(page.get('AccountIds', []))
+
+            user_principal_ids: set[str] = set()
+            for acct in assigned_accounts:
+                p = sso.get_paginator('list_account_assignments')
+                for page in p.paginate(
+                    InstanceArn=instance_arn,
+                    AccountId=acct,
+                    PermissionSetArn=ps_arn,
+                ):
+                    for asg in page.get('AccountAssignments', []):
+                        if asg.get('PrincipalType') == 'USER':
+                            user_principal_ids.add(asg['PrincipalId'])
+
+            for uid in user_principal_ids:
+                try:
+                    u = idstore.describe_user(
+                        IdentityStoreId=identity_store_id, UserId=uid,
+                    )
+                    if u.get('UserName') == buf.requester_iic_user:
+                        logger.info(
+                            f'[{request_id}] Requester {buf.requester_iic_user!r} '
+                            f'confirmed as USER assigned to PS {ps_name!r}'
+                        )
+                        return True
+                except ClientError as e:
+                    logger.warning(
+                        f'[{request_id}] DescribeUser({uid}) failed: '
+                        f'{e.response["Error"].get("Code")}'
+                    )
+
+            logger.warning(
+                f'[{request_id}] Requester {buf.requester_iic_user!r} is not '
+                f'among USER assignments of PS {ps_name!r} '
+                f'(checked {len(user_principal_ids)} users across '
+                f'{len(assigned_accounts)} accounts)'
+            )
+            return False
+
+        except ClientError as e:
+            logger.error(
+                f'[{request_id}] IIC ownership check failed: '
+                f'{e.response["Error"].get("Code")}: {e}'
+            )
+            return False
+        except Exception as e:
+            logger.error(
+                f'[{request_id}] IIC ownership check unexpected error: '
+                f'{type(e).__name__}: {e}',
+                exc_info=True,
+            )
+            return False
+
     def _state_exists(self, buf: RoleBuffer, request_id: str) -> bool:
         """
         S3 Terraform state 파일 존재 여부로 파이프라인 관리 대상 확인 (1회 API 호출).
@@ -517,6 +647,16 @@ class Pipeline:
             logger.info(
                 f'[{request_id}] === Pipeline skipped '
                 f'(no state file: {state_key}) ==='
+            )
+            return
+
+        # DeleteRole 이벤트 발화자가 해당 PS에 실제로 assign된 USER인지 확인.
+        # 다른 사용자가 무관한 Role을 지워 PS가 파괴되는 사고를 차단한다.
+        if not self._verify_requester_owns_ps(buf, request_id):
+            logger.error(
+                f'[{request_id}] === Pipeline aborted: requester '
+                f'{buf.requester_iic_user!r} is not assigned to PS '
+                f'(account={buf.account_id}, role={buf.role_name}) ==='
             )
             return
 
