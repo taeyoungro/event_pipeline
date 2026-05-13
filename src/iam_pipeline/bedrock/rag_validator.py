@@ -19,10 +19,12 @@ class BedrockRAGValidator:
     ):
         """
         Args:
-            model_id: Bedrock 모델/Inference Profile의 전체 ARN.
-                예) arn:aws:bedrock:us-east-1::foundation-model/...
-                    arn:aws:bedrock:us-east-1:<acct>:inference-profile/us.amazon.nova-2-lite-v1:0
-                RetrieveAndGenerate.modelArn에 그대로 전달된다.
+            model_id: 아래 셋 중 하나.
+              1) 전체 ARN (arn:aws:bedrock:...) — 그대로 사용
+              2) 시스템 inference profile ID (us./eu./apac./global. 접두사)
+                 → arn:aws:bedrock:<region>:<account>:inference-profile/<id> 로 구성
+              3) foundation model ID (예: anthropic.claude-3-haiku-20240307-v1:0)
+                 → arn:aws:bedrock:<region>::foundation-model/<id> 로 구성
         """
         if not knowledge_base_id:
             raise ValueError(
@@ -31,10 +33,6 @@ class BedrockRAGValidator:
         if not model_id:
             raise ValueError(
                 "model_id is empty — set BEDROCK_MODEL_ID in .env"
-            )
-        if not model_id.startswith("arn:"):
-            raise ValueError(
-                f"BEDROCK_MODEL_ID must be a full ARN (got: {model_id!r})"
             )
         if not region:
             raise ValueError(
@@ -45,6 +43,19 @@ class BedrockRAGValidator:
         self.region = region
         self._bedrock = boto3.client("bedrock-agent-runtime", region_name=region)
         self._bedrock_models = boto3.client("bedrock", region_name=region)
+        self.model_arn = self._resolve_model_arn(model_id, region)
+        logger.info(f"Resolved Bedrock modelArn: {self.model_arn}")
+
+    @staticmethod
+    def _resolve_model_arn(model_id: str, region: str) -> str:
+        if model_id.startswith("arn:"):
+            return model_id
+        # 시스템 cross-region inference profile은 us./eu./apac./global. 접두사를 사용
+        _PROFILE_PREFIXES = ("us.", "eu.", "apac.", "global.")
+        if model_id.startswith(_PROFILE_PREFIXES):
+            account_id = boto3.client("sts").get_caller_identity()["Account"]
+            return f"arn:aws:bedrock:{region}:{account_id}:inference-profile/{model_id}"
+        return f"arn:aws:bedrock:{region}::foundation-model/{model_id}"
 
     async def validate_least_privilege(
         self,
@@ -209,7 +220,7 @@ class BedrockRAGValidator:
                     "type": "KNOWLEDGE_BASE",
                     "knowledgeBaseConfiguration": {
                         "knowledgeBaseId": self.knowledge_base_id,
-                        "modelArn": self.model_id,
+                        "modelArn": self.model_arn,
                         "retrievalConfiguration": {
                             "vectorSearchConfiguration": {
                                 "numberOfResults": 5,
