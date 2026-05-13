@@ -90,17 +90,14 @@ class BedrockRAGValidator:
     def _resolve_model_arn(model_id: str, region: str, account_id: str) -> str:
         _PROFILE_PREFIXES = ("us.", "eu.", "apac.", "global.")
 
-        # ARN으로 주어진 경우 마지막 경로 토큰을 모델/프로필 식별자로 사용
+        # ARN으로 주어진 경우 마지막 경로 토큰만 추출 (ARN 내 리전은 무시하고 설정값 사용)
         bare = model_id.rsplit("/", 1)[-1] if model_id.startswith("arn:") else model_id
 
-        # cross-region inference profile 접두사면 무조건 inference-profile ARN으로 재구성.
-        # (사용자가 foundation-model/us.xxx 형태의 잘못된 ARN을 넣어도 교정한다.)
+        # cross-region inference profile 접두사면 inference-profile ARN으로 재구성
         if bare.startswith(_PROFILE_PREFIXES):
             return f"arn:aws:bedrock:{region}:{account_id}:inference-profile/{bare}"
 
-        if model_id.startswith("arn:"):
-            return model_id
-
+        # foundation-model: 항상 설정된 region으로 재조합 (ARN에 다른 리전이 포함돼도 교정)
         return f"arn:aws:bedrock:{region}::foundation-model/{bare}"
 
     async def validate_least_privilege(
