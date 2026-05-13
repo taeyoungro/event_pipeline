@@ -21,7 +21,7 @@ from botocore.exceptions import ClientError
 from ..bedrock.rag_validator import BedrockRAGValidator
 from ..codegen.buffer import BufferAction, RoleBuffer
 from ..codegen.policy_fetcher import PolicyFetcher
-from ..codegen.policy_utils import has_dangerous_trust, is_service_role
+from ..codegen.policy_utils import has_dangerous_trust, is_aws_managed_policy, is_service_role
 from ..codegen.tf_writer import write_destroy_workspace, write_workspace
 from ..config import settings
 from ..executor.runner import TerraformRunner
@@ -418,24 +418,50 @@ class Pipeline:
                             {"is_necessary": True, "confidence": "n/a", "reason": "(RAG analysis unavailable)"},
                         )
                 else:
-                    # 기존 PS: IIC SSO에서 현재 PS 정책 목록을 조회해 diff,
-                    # 신규로 추가된 Policy만 RAG 최소권한 검증 수행.
-                    existing_arns = await asyncio.to_thread(
+                    # 기존 PS: AMP/CMP를 각각 diff하여 신규 추가분만 RAG 검증.
+                    # AMP diff: IIC SSO list_managed_policies_in_permission_set
+                    # CMP diff: output_base의 metadata.json (이전 apply 시 기록)
+                    existing_amp_arns = await asyncio.to_thread(
                         self._get_ps_policy_arns, buf, request_id
                     )
-                    new_policy_arns = buf.policy_arns - existing_arns
+                    existing_cmp_arns = self._get_previous_cmp_arns(buf)
 
-                    if new_policy_arns and self.rag_validator:
+                    new_amp_arns = {
+                        a for a in buf.policy_arns if is_aws_managed_policy(a)
+                    } - existing_amp_arns
+                    new_cmp_arns = {
+                        a for a in buf.policy_arns if not is_aws_managed_policy(a)
+                    } - existing_cmp_arns
+                    new_arns = new_amp_arns | new_cmp_arns
+
+                    if new_arns and self.rag_validator:
+                        # 신규 CMP는 문서 내용을 가져와 RAG에 함께 전달
+                        new_cmp_docs: dict[str, dict] = {}
+                        for arn in new_cmp_arns:
+                            try:
+                                doc = await asyncio.to_thread(
+                                    fetcher.get_customer_policy_document,
+                                    buf.account_id, arn,
+                                )
+                                new_cmp_docs[arn] = doc
+                            except RuntimeError as e:
+                                logger.warning(
+                                    f'[{request_id}] CMP document fetch failed for '
+                                    f'{arn}: {e} — will be treated as necessary'
+                                )
+
                         logger.info(
                             f'[{request_id}] Existing PS — RAG validating '
-                            f'{len(new_policy_arns)} new policy(ies): {new_policy_arns}'
+                            f'{len(new_amp_arns)} new AMP(s), '
+                            f'{len(new_cmp_arns)} new CMP(s)'
                         )
                         try:
                             validation_result = await self.rag_validator.validate_least_privilege(
                                 account_id=buf.account_id,
                                 role_name=buf.role_name,
                                 iic_user=buf.requester_iic_user,
-                                policy_arns=new_policy_arns,
+                                policy_arns=new_amp_arns,
+                                inline_policy_docs=new_cmp_docs or None,
                                 target_account_ids=target_account_ids,
                                 terraform_plan=plan_output,
                             )
@@ -461,7 +487,7 @@ class Pipeline:
                                 f'[{request_id}] RAG validation error: {e}'
                             )
                             raise
-                    elif not new_policy_arns:
+                    elif not new_arns:
                         logger.info(
                             f'[{request_id}] Existing PS — no new policies detected, skipping RAG'
                         )
@@ -470,9 +496,9 @@ class Pipeline:
                             f'[{request_id}] Existing PS — RAG validator not configured, skipping RAG'
                         )
 
-                    # 기존 Policy는 "(previously approved)", 신규는 RAG 결과 또는 fallback
+                    # 승인 리포트: 기존 Policy는 "(previously approved)", 신규는 RAG 결과 또는 fallback
                     for arn in buf.policy_arns:
-                        if arn not in new_policy_arns:
+                        if arn not in new_arns:
                             policy_details.setdefault(arn, {
                                 "is_necessary": True,
                                 "confidence": "n/a",
@@ -687,6 +713,19 @@ class Pipeline:
                 exc_info=True,
             )
             return False
+
+    def _get_previous_cmp_arns(self, buf: RoleBuffer) -> set[str]:
+        """이전 terraform apply 시 처리된 CMP ARN 목록을 metadata.json에서 반환.
+
+        metadata.json은 write_workspace()가 output_base에 기록하며 apply 간 유지된다.
+        파일이 없거나 파싱 실패 시 빈 set 반환 → 호출부에서 전체 CMP를 신규로 간주.
+        """
+        meta_path = self.output_base / buf.account_id / buf.role_name / 'metadata.json'
+        try:
+            meta = json.loads(meta_path.read_text(encoding='utf-8'))
+            return set(meta.get('customer_managed_policies', []))
+        except (FileNotFoundError, json.JSONDecodeError):
+            return set()
 
     def _get_ps_policy_arns(self, buf: RoleBuffer, request_id: str) -> set[str]:
         """IIC SSO에서 기존 PS에 현재 연결된 Managed Policy ARN 목록을 반환.
