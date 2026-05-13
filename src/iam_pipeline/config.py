@@ -12,6 +12,7 @@ class Settings(BaseSettings):
 
     # 공통
     aws_region: str = 'us-east-1'
+    aws_account_id: str = ''  # .env(GitHub Secret 주입)에서 로드
     secret_api_key: str = 'change-me-in-production'
 
     # Codegen

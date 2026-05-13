@@ -109,6 +109,7 @@ class Pipeline:
             BedrockRAGValidator(
                 knowledge_base_id=settings.bedrock_knowledge_base_id,
                 model_id=settings.bedrock_model_id,
+                account_id=settings.aws_account_id,
                 region=settings.bedrock_region,
             )
             if settings.bedrock_enable_rag_validation
