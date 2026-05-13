@@ -368,52 +368,68 @@ class Pipeline:
                 )
             else:
                 policy_details: dict[str, dict] = {}
-                if self.rag_validator:
-                    logger.info(
-                        f'[{request_id}] Validating least-privilege with Bedrock RAG '
-                        f'(user={buf.requester_iic_user}, account={buf.account_id})'
-                    )
-                    try:
-                        validation_result = await self.rag_validator.validate_least_privilege(
-                            account_id=buf.account_id,
-                            role_name=buf.role_name,
-                            iic_user=buf.requester_iic_user,
-                            policy_arns=buf.policy_arns,
-                            target_account_ids=target_account_ids,
-                            terraform_plan=plan_output,
-                        )
+                is_new_ps = not self._state_exists(buf, request_id)
 
-                        if not validation_result["approved"]:
-                            reason = validation_result["reason"]
-                            logger.error(
-                                f'[{request_id}] RAG validation failed: {reason}'
-                            )
-                            if validation_result["requires_approval"]:
-                                await self._request_admin_approval(
-                                    buf, request_id, reason, validation_result
-                                )
-                            raise RuntimeError(
-                                f'Least-privilege validation failed: {reason}'
-                            )
-
-                        policy_details = validation_result.get("policies_validated", {})
+                if is_new_ps:
+                    # 신규 PS: 모든 Policy에 대해 RAG 최소권한 검증 수행
+                    if self.rag_validator:
                         logger.info(
-                            f'[{request_id}] RAG validation succeeded: '
-                            f'{validation_result["reason"]}'
+                            f'[{request_id}] New PS — validating least-privilege with Bedrock RAG '
+                            f'(user={buf.requester_iic_user}, account={buf.account_id})'
                         )
-                    except RuntimeError as e:
-                        logger.error(
-                            f'[{request_id}] RAG validation error: {e}'
-                        )
-                        raise
+                        try:
+                            validation_result = await self.rag_validator.validate_least_privilege(
+                                account_id=buf.account_id,
+                                role_name=buf.role_name,
+                                iic_user=buf.requester_iic_user,
+                                policy_arns=buf.policy_arns,
+                                target_account_ids=target_account_ids,
+                                terraform_plan=plan_output,
+                            )
 
-                # RAG 검증기가 없거나 응답에 정책 상세가 빠진 경우의 fallback —
-                # ARN만으로 최소 정보(타입/이름)로 리포트를 구성.
-                for arn in buf.policy_arns:
-                    policy_details.setdefault(
-                        arn,
-                        {"is_necessary": True, "confidence": "n/a", "reason": "(RAG analysis unavailable)"},
+                            if not validation_result["approved"]:
+                                reason = validation_result["reason"]
+                                logger.error(
+                                    f'[{request_id}] RAG validation failed: {reason}'
+                                )
+                                if validation_result["requires_approval"]:
+                                    await self._request_admin_approval(
+                                        buf, request_id, reason, validation_result
+                                    )
+                                raise RuntimeError(
+                                    f'Least-privilege validation failed: {reason}'
+                                )
+
+                            policy_details = validation_result.get("policies_validated", {})
+                            logger.info(
+                                f'[{request_id}] RAG validation succeeded: '
+                                f'{validation_result["reason"]}'
+                            )
+                        except RuntimeError as e:
+                            logger.error(
+                                f'[{request_id}] RAG validation error: {e}'
+                            )
+                            raise
+
+                    # RAG 검증기가 없거나 응답에 정책 상세가 빠진 경우의 fallback
+                    for arn in buf.policy_arns:
+                        policy_details.setdefault(
+                            arn,
+                            {"is_necessary": True, "confidence": "n/a", "reason": "(RAG analysis unavailable)"},
+                        )
+                else:
+                    # 기존 PS에 Policy 추가: 이미 승인된 PS이므로 RAG 생략.
+                    # 단, 권한 상승 시도 가능성이 있으므로 관리자 승인 게이트는 그대로 적용.
+                    logger.info(
+                        f'[{request_id}] Existing PS — skipping RAG validation '
+                        f'(policy escalation check delegated to admin approval)'
                     )
+                    for arn in buf.policy_arns:
+                        policy_details[arn] = {
+                            "is_necessary": True,
+                            "confidence": "n/a",
+                            "reason": "(existing PS — RAG skipped, admin approval required)",
+                        }
 
                 # 관리자 승인 리포트: 사람이 읽기 좋은 텍스트 + 구조화 JSON 저장
                 approval_report = build_approval_report(
