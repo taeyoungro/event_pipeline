@@ -17,6 +17,13 @@ class BedrockRAGValidator:
         model_id: str,
         region: str = "us-east-1",
     ):
+        """
+        Args:
+            model_id: Bedrock 모델/Inference Profile의 전체 ARN.
+                예) arn:aws:bedrock:us-east-1::foundation-model/...
+                    arn:aws:bedrock:us-east-1:<acct>:inference-profile/us.amazon.nova-2-lite-v1:0
+                RetrieveAndGenerate.modelArn에 그대로 전달된다.
+        """
         if not knowledge_base_id:
             raise ValueError(
                 "knowledge_base_id is empty — set BEDROCK_KNOWLEDGE_BASE_ID in .env"
@@ -24,6 +31,10 @@ class BedrockRAGValidator:
         if not model_id:
             raise ValueError(
                 "model_id is empty — set BEDROCK_MODEL_ID in .env"
+            )
+        if not model_id.startswith("arn:"):
+            raise ValueError(
+                f"BEDROCK_MODEL_ID must be a full ARN (got: {model_id!r})"
             )
         if not region:
             raise ValueError(
@@ -192,18 +203,13 @@ class BedrockRAGValidator:
         print("=" * 60)
 
         try:
-            model_arn = (
-                self.model_id
-                if self.model_id.startswith("arn:")
-                else f"arn:aws:bedrock:{self.region}::foundation-model/{self.model_id}"
-            )
             response = self._bedrock.retrieve_and_generate(
                 input={"text": query},
                 retrieveAndGenerateConfiguration={
                     "type": "KNOWLEDGE_BASE",
                     "knowledgeBaseConfiguration": {
                         "knowledgeBaseId": self.knowledge_base_id,
-                        "modelArn": model_arn,
+                        "modelArn": self.model_id,
                         "retrievalConfiguration": {
                             "vectorSearchConfiguration": {
                                 "numberOfResults": 5,

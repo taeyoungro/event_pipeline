@@ -42,6 +42,7 @@ class Settings(BaseSettings):
 
     # Phase 5.2: Bedrock RAG 최소권한 검증
     # 두 값 모두 .env(GitHub Secret 주입)에서 로드 — 코드 내 기본값 없음.
+    # bedrock_model_id는 foundation-model 또는 inference-profile의 전체 ARN.
     bedrock_knowledge_base_id: str = ''
     bedrock_model_id: str = ''
     bedrock_region: str = 'us-east-1'
