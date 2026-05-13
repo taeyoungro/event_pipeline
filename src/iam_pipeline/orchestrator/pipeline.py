@@ -242,21 +242,6 @@ class Pipeline:
                 )
                 return
 
-            # AttachRolePolicy(ATTACH): iic-target-accounts 태그 유무로 관리 대상 판별.
-            # 이 태그는 "어떤 멤버 계정에 PS를 배포할지" 를 지정하는 opt-in 마커이기도 하므로,
-            # 태그가 없는 Role은 파이프라인 스코프 밖으로 간주하고 즉시 skip한다.
-            # (REFRESH/DELETE는 state 파일로 판별하므로 여기서는 ATTACH만 체크)
-            if buf.action == BufferAction.ATTACH:
-                tags = await asyncio.to_thread(
-                    fetcher.get_role_tags, buf.account_id, buf.role_name
-                )
-                if settings.iic_target_accounts_tag not in tags:
-                    logger.info(
-                        f'[{request_id}] ATTACH: role={buf.role_name} lacks tag '
-                        f'"{settings.iic_target_accounts_tag}" — not in pipeline scope, skipping.'
-                    )
-                    return
-
             # AttachRolePolicy(ATTACH): RAG + 관리자 승인 게이트 적용
             # DetachRolePolicy(REFRESH): 요청자 소유권 검증만, RAG/승인 생략
             skip_validation = (buf.action == BufferAction.REFRESH)
