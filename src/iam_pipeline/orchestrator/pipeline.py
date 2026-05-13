@@ -232,6 +232,16 @@ class Pipeline:
                 await self._process_delete(buf, request_id)
                 return
 
+            # DetachRolePolicy(REFRESH): 파이프라인이 관리하는 Role인지 먼저 확인.
+            # Role 삭제 시 AWS는 DetachRolePolicy → DeleteRole 순으로 이벤트를 발행하므로
+            # REFRESH 이벤트가 먼저 처리될 수 있음. state 파일이 없으면 비관리 Role이므로 skip.
+            if buf.action == BufferAction.REFRESH and not self._state_exists(buf, request_id):
+                logger.info(
+                    f'[{request_id}] REFRESH: state file not found for role={buf.role_name}'
+                    ' — not managed by this pipeline, skipping.'
+                )
+                return
+
             # AttachRolePolicy(ATTACH): RAG + 관리자 승인 게이트 적용
             # DetachRolePolicy(REFRESH): 요청자 소유권 검증만, RAG/승인 생략
             skip_validation = (buf.action == BufferAction.REFRESH)
