@@ -588,7 +588,8 @@ class Pipeline:
 
         - 표시 정보: 요청자, 소스 계정, 대상 계정, Role, 정책 ARN 목록, terraform plan 요약
         - 'Y' 또는 'y'만 승인으로 간주, 그 외 입력 및 EOF/비대화형 stdin은 거부로 처리한다.
-        - input()은 블로킹이므로 asyncio.to_thread로 실행해 이벤트 루프를 점유하지 않는다.
+        - /dev/tty를 직접 열어 stdin이 닫혀있거나 uvicorn/systemd가 점유한 경우에도
+          제어 터미널과 통신한다. /dev/tty가 없으면 거부.
         """
         plan_tail = plan_output[-3000:] if len(plan_output) > 3000 else plan_output
 
@@ -606,18 +607,21 @@ class Pipeline:
             'Apply this plan and create/update the IIC PermissionSet? [y/N]: '
         )
 
-        logger.info(f'[{request_id}] Waiting for admin approval (terminal)')
-
-        if not sys.stdin or not sys.stdin.isatty():
-            logger.error(
-                f'[{request_id}] Admin approval required but stdin is not a TTY — denying'
-            )
-            return False
+        logger.info(f'[{request_id}] Waiting for admin approval (/dev/tty)')
 
         def _ask() -> str:
+            # /dev/tty는 stdin/stdout과 무관하게 제어 터미널에 직접 연결된다.
+            # uvicorn이나 systemd가 stdin을 닫거나 점유한 환경에서도 동작.
             try:
-                return input(banner)
-            except EOFError:
+                with open('/dev/tty', 'r+') as tty:
+                    tty.write(banner)
+                    tty.flush()
+                    line = tty.readline()
+                    return line  # readline은 EOF 시 '' 반환
+            except OSError as e:
+                logger.error(
+                    f'[{request_id}] /dev/tty unavailable ({e}) — denying approval'
+                )
                 return ''
 
         answer = (await asyncio.to_thread(_ask)).strip().lower()
