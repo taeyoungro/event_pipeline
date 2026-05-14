@@ -17,6 +17,7 @@ from ..executor.runner import TerraformRunner
 from ..logging_setup import setup_logging
 from ..orchestrator.pipeline import Pipeline
 from .approval_store import ApprovalStore
+from .resource_store import ResourceStore
 from .buffer import BufferManager, RoleBuffer
 from .event_parser import extract_event_info
 
@@ -34,11 +35,13 @@ runner = TerraformRunner(
     plugin_cache_dir=settings.tf_plugin_cache_dir,
 )
 approval_store = ApprovalStore(base_dir=settings.approval_report_dir)
+resource_store = ResourceStore(base_dir=settings.resource_log_dir)
 pipeline = Pipeline(
     output_base=settings.output_base_dir,
     work_base=settings.work_base_dir,
     runner=runner,
     approval_store=approval_store,
+    resource_store=resource_store,
 )
 buffer_manager = BufferManager(
     debounce_seconds=settings.debounce_seconds,
@@ -226,6 +229,57 @@ async def decide_approval(
     )
     if rec is None:
         raise HTTPException(status_code=404, detail='Approval not found')
+    return rec
+
+
+# ── 리소스 관리 API ────────────────────────────────────────────────────────────
+
+@app.get('/resources')
+async def list_resources(x_api_key: Optional[str] = Header(None)):
+    _require_api_key(x_api_key)
+    return resource_store.list_all()
+
+
+@app.get('/resources/stream')
+async def stream_resources(
+    request: Request,
+    x_api_key: Optional[str] = Header(None),
+    api_key: Optional[str] = Query(None),
+):
+    key = x_api_key or api_key
+    _require_api_key(key)
+
+    queue = resource_store.subscribe()
+
+    async def event_gen():
+        yield 'retry: 5000\n\n'
+        yield f'event: snapshot\ndata: {json.dumps(resource_store.list_all())}\n\n'
+        try:
+            while True:
+                if await request.is_disconnected():
+                    break
+                try:
+                    ev = await asyncio.wait_for(queue.get(), timeout=15.0)
+                except asyncio.TimeoutError:
+                    yield ': keep-alive\n\n'
+                    continue
+                yield f'event: change\ndata: {json.dumps(ev)}\n\n'
+        finally:
+            resource_store.unsubscribe(queue)
+
+    return StreamingResponse(
+        event_gen(),
+        media_type='text/event-stream',
+        headers={'Cache-Control': 'no-cache, no-transform', 'X-Accel-Buffering': 'no'},
+    )
+
+
+@app.get('/resources/{event_id}')
+async def get_resource(event_id: str, x_api_key: Optional[str] = Header(None)):
+    _require_api_key(x_api_key)
+    rec = resource_store.get(event_id)
+    if rec is None:
+        raise HTTPException(status_code=404, detail='Resource event not found')
     return rec
 
 

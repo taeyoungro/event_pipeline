@@ -31,6 +31,7 @@ class Settings(BaseSettings):
     # Executor
     work_base_dir: Path = Path('/home/ec2-user/iam_pipeline/work')
     approval_report_dir: Path = Path('/home/ec2-user/iam_pipeline/approvals')
+    resource_log_dir: Path = Path('/home/ec2-user/iam_pipeline/resources')
     tf_state_bucket: str = 'nty-org-policy-terraform-state'
     tf_state_region: str = 'us-east-1'
     tf_state_lock_table: str = 'nty-tf-state-lock'
@@ -67,6 +68,7 @@ class Settings(BaseSettings):
             self.payload_dir,
             self.work_base_dir,
             self.approval_report_dir,
+            self.resource_log_dir,
         ):
             p.mkdir(parents=True, exist_ok=True)
 

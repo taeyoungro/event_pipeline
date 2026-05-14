@@ -20,6 +20,7 @@ from botocore.exceptions import ClientError
 
 from ..bedrock.rag_validator import BedrockRAGValidator
 from ..codegen.approval_store import ApprovalStore
+from ..codegen.resource_store import ResourceStore
 from ..codegen.buffer import BufferAction, RoleBuffer
 from ..codegen.policy_fetcher import PolicyFetcher
 from ..codegen.policy_utils import has_dangerous_trust, is_aws_managed_policy, is_service_role
@@ -193,11 +194,13 @@ class Pipeline:
         work_base: Path,
         runner: TerraformRunner,
         approval_store: Optional[ApprovalStore] = None,
+        resource_store: Optional[ResourceStore] = None,
     ):
         self.output_base = output_base
         self.work_base = work_base
         self.runner = runner
         self.approval_store = approval_store
+        self.resource_store = resource_store
         self.rag_validator = (
             BedrockRAGValidator(
                 knowledge_base_id=settings.bedrock_knowledge_base_id,
@@ -555,6 +558,23 @@ class Pipeline:
                 raise
             if self.approval_store is not None and not skip_validation:
                 self.approval_store.update_status(request_id, 'applied')
+            if self.resource_store is not None:
+                reviewer = None
+                if self.approval_store is not None:
+                    rec = self.approval_store.get(request_id)
+                    if rec:
+                        reviewer = rec.get('reviewer')
+                self.resource_store.record(
+                    request_id=request_id,
+                    account_id=buf.account_id,
+                    role_name=buf.role_name,
+                    action=buf.action.value,
+                    outcome='applied',
+                    policy_arns=sorted(buf.policy_arns),
+                    target_accounts=target_account_ids,
+                    requester_iic_user=buf.requester_iic_user,
+                    reviewer=reviewer,
+                )
             logger.info(f'[{request_id}] === Pipeline succeeded ===')
         except Exception:
             raise
@@ -890,6 +910,18 @@ class Pipeline:
             )
             logger.info(f'[{request_id}] === Pipeline destroy succeeded ===')
             self._delete_state_file(state_key, request_id)
+            if self.resource_store is not None:
+                self.resource_store.record(
+                    request_id=request_id,
+                    account_id=buf.account_id,
+                    role_name=buf.role_name,
+                    action=buf.action.value,
+                    outcome='destroyed',
+                    policy_arns=[],
+                    target_accounts=[],
+                    requester_iic_user=buf.requester_iic_user,
+                    reviewer=None,
+                )
         except Exception as e:
             logger.error(
                 f'[{request_id}] === Pipeline destroy failed: '
