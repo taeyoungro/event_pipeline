@@ -50,6 +50,14 @@ class Settings(BaseSettings):
     bedrock_region: str = 'us-east-1'
     bedrock_enable_rag_validation: bool = True
 
+    # 관리자 대시보드 (정적 SPA + /approvals 라우터를 동일 서버에서 호스팅)
+    # 빈 문자열이면 비활성화. 콤마 구분 origin 목록(CORS).
+    dashboard_cors_origins: str = 'http://localhost:5173'
+    # 빌드된 SPA(dist/)를 서빙할 디스크 경로. 비어 있거나 경로가 없으면 정적 서빙 비활성.
+    dashboard_static_dir: Path = Path('')
+    # 관리자 결정을 기다리는 최대 시간(초). 기본 24h.
+    approval_timeout_seconds: int = 24 * 60 * 60
+
     # 로깅
     log_level: str = 'INFO'
 

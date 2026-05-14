@@ -19,6 +19,7 @@ import boto3
 from botocore.exceptions import ClientError
 
 from ..bedrock.rag_validator import BedrockRAGValidator
+from ..codegen.approval_store import ApprovalStore
 from ..codegen.buffer import BufferAction, RoleBuffer
 from ..codegen.policy_fetcher import PolicyFetcher
 from ..codegen.policy_utils import has_dangerous_trust, is_aws_managed_policy, is_service_role
@@ -191,10 +192,12 @@ class Pipeline:
         output_base: Path,
         work_base: Path,
         runner: TerraformRunner,
+        approval_store: Optional[ApprovalStore] = None,
     ):
         self.output_base = output_base
         self.work_base = work_base
         self.runner = runner
+        self.approval_store = approval_store
         self.rag_validator = (
             BedrockRAGValidator(
                 knowledge_base_id=settings.bedrock_knowledge_base_id,
@@ -526,6 +529,7 @@ class Pipeline:
                     plan_output=plan_output,
                     request_id=request_id,
                     approval_report=approval_report,
+                    policy_details=policy_details,
                 )
                 if not approved:
                     logger.warning(
@@ -536,10 +540,21 @@ class Pipeline:
 
             # 검증 통과 시 apply 실행
             logger.info(f'[{request_id}] Applying terraform plan')
-            self.runner.apply_plan(
-                work_dir=work_dir,
-                request_id=request_id,
-            )
+            if self.approval_store is not None and not skip_validation:
+                self.approval_store.update_status(request_id, 'applying')
+            try:
+                self.runner.apply_plan(
+                    work_dir=work_dir,
+                    request_id=request_id,
+                )
+            except Exception as e:
+                if self.approval_store is not None and not skip_validation:
+                    self.approval_store.update_status(
+                        request_id, 'failed', error=f'{type(e).__name__}: {e}',
+                    )
+                raise
+            if self.approval_store is not None and not skip_validation:
+                self.approval_store.update_status(request_id, 'applied')
             logger.info(f'[{request_id}] === Pipeline succeeded ===')
         except Exception:
             raise
@@ -589,56 +604,47 @@ class Pipeline:
         plan_output: str,
         request_id: str,
         approval_report: str = '',
+        policy_details: Optional[dict[str, dict]] = None,
     ) -> bool:
-        """터미널에서 관리자에게 최종 승인(Y/N)을 받아 apply 여부를 결정한다.
+        """관리자 대시보드를 통해 최종 승인 여부를 받는다.
 
-        - 표시 정보: 요청자, 소스 계정, 대상 계정, Role, 정책 ARN 목록, terraform plan 요약
-        - 'Y' 또는 'y'만 승인으로 간주, 그 외 입력 및 EOF/비대화형 stdin은 거부로 처리한다.
-        - /dev/tty를 직접 열어 stdin이 닫혀있거나 uvicorn/systemd가 점유한 경우에도
-          제어 터미널과 통신한다. /dev/tty가 없으면 거부.
+        approval_store에 pending 레코드를 등록하고, 대시보드에서 decide가 호출될 때까지
+        asyncio.Future로 대기. 타임아웃 시 거부로 처리.
         """
+        if self.approval_store is None:
+            logger.error(
+                f'[{request_id}] approval_store not configured — denying approval'
+            )
+            return False
+
         plan_tail = plan_output[-3000:] if len(plan_output) > 3000 else plan_output
 
-        banner = (
-            '\n' + '=' * 70 + '\n'
-            f'[ADMIN APPROVAL REQUIRED] request_id={request_id}\n'
-            + '=' * 70 + '\n'
-            + (approval_report + '-' * 70 + '\n' if approval_report else '')
-            + f'  IAM Role             : {buf.role_name}\n'
-            f'  Action               : {buf.action.value}\n'
-            + '-' * 70 + '\n'
-            '  Terraform plan (tail):\n'
-            f'{plan_tail}\n'
-            + '=' * 70 + '\n'
-            'Apply this plan and create/update the IIC PermissionSet? [y/N]: '
+        record = {
+            'request_id': request_id,
+            'account_id': buf.account_id,
+            'role_name': buf.role_name,
+            'action': buf.action.value,
+            'requester_iic_user': buf.requester_iic_user,
+            'target_accounts': target_account_ids,
+            'policy_arns': sorted(buf.policy_arns),
+            'policy_details': policy_details or {},
+            'approval_report': approval_report,
+            'plan_tail': plan_tail,
+            'first_event_at': buf.first_event_at.isoformat() if buf.first_event_at else None,
+            'last_event_at': buf.last_event_at.isoformat() if buf.last_event_at else None,
+        }
+        self.approval_store.register(record)
+        logger.info(
+            f'[{request_id}] Awaiting admin approval via dashboard '
+            f'(timeout={settings.approval_timeout_seconds}s)'
         )
 
-        logger.info(f'[{request_id}] Waiting for admin approval (/dev/tty)')
-
-        def _ask() -> str:
-            # /dev/tty는 stdin/stdout과 무관하게 제어 터미널에 직접 연결된다.
-            # 'r+' text mode는 seekable 요구로 OSError가 나므로 읽기/쓰기 핸들을 분리.
-            try:
-                tty_out = open('/dev/tty', 'w')
-                tty_in = open('/dev/tty', 'r')
-            except OSError as e:
-                logger.error(
-                    f'[{request_id}] /dev/tty unavailable ({e}) — denying approval'
-                )
-                return ''
-            try:
-                tty_out.write(banner)
-                tty_out.flush()
-                return tty_in.readline()  # EOF 시 '' 반환
-            finally:
-                tty_in.close()
-                tty_out.close()
-
-        answer = (await asyncio.to_thread(_ask)).strip().lower()
-        approved = answer == 'y'
+        approved = await self.approval_store.wait_for_decision(
+            request_id, timeout_seconds=float(settings.approval_timeout_seconds)
+        )
         logger.info(
             f'[{request_id}] Admin approval result: '
-            f'{"APPROVED" if approved else "DENIED"} (input={answer!r})'
+            f'{"APPROVED" if approved else "DENIED"}'
         )
         return approved
 
