@@ -57,6 +57,25 @@ class ApprovalStore:
         self.base_dir.mkdir(parents=True, exist_ok=True)
         self._futures: dict[str, asyncio.Future[bool]] = {}
         self._lock = asyncio.Lock()
+        self._subscribers: set[asyncio.Queue[dict[str, Any]]] = set()
+
+    # ── SSE pub/sub ────────────────────────────────────────────────────────
+
+    def subscribe(self) -> asyncio.Queue[dict[str, Any]]:
+        q: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=64)
+        self._subscribers.add(q)
+        return q
+
+    def unsubscribe(self, q: asyncio.Queue[dict[str, Any]]) -> None:
+        self._subscribers.discard(q)
+
+    def _broadcast(self, event: dict[str, Any]) -> None:
+        # Sync helper — drop events for slow consumers rather than block the pipeline.
+        for q in list(self._subscribers):
+            try:
+                q.put_nowait(event)
+            except asyncio.QueueFull:
+                logger.warning('SSE subscriber queue full — dropping event')
 
     # ── 파일 IO ────────────────────────────────────────────────────────────
 
@@ -97,6 +116,11 @@ class ApprovalStore:
         fut: asyncio.Future[bool] = loop.create_future()
         self._futures[record['request_id']] = fut
         logger.info(f'[{record["request_id"]}] approval registered as pending')
+        self._broadcast({
+            'type': 'created',
+            'request_id': record['request_id'],
+            'status': 'pending',
+        })
         return fut
 
     def get(self, request_id: str) -> Optional[dict[str, Any]]:
@@ -132,6 +156,11 @@ class ApprovalStore:
         rec['status'] = status
         rec.update(extra)
         self._write(rec)
+        self._broadcast({
+            'type': 'updated',
+            'request_id': request_id,
+            'status': status,
+        })
         return rec
 
     def decide(
@@ -170,6 +199,11 @@ class ApprovalStore:
                 f'[{request_id}] decision recorded but no awaiting future '
                 '(server may have restarted — apply will not run)'
             )
+        self._broadcast({
+            'type': 'updated',
+            'request_id': request_id,
+            'status': rec['status'],
+        })
         return rec
 
     async def wait_for_decision(

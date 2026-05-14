@@ -4,8 +4,11 @@ import logging
 from datetime import datetime, timezone
 from typing import Optional
 
-from fastapi import FastAPI, Header, HTTPException, Request
+import asyncio
+
+from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -166,6 +169,46 @@ async def get_approval(request_id: str, x_api_key: Optional[str] = Header(None))
     if rec is None:
         raise HTTPException(status_code=404, detail='Approval not found')
     return rec
+
+
+@app.get('/approvals/stream')
+async def stream_approvals(
+    request: Request,
+    x_api_key: Optional[str] = Header(None),
+    api_key: Optional[str] = Query(None),
+):
+    # EventSource는 커스텀 헤더를 못 보내므로 쿼리스트링 api_key도 허용.
+    key = x_api_key or api_key
+    _require_api_key(key)
+
+    queue = approval_store.subscribe()
+
+    async def event_gen():
+        # 연결 직후 초기 스냅샷을 보내 클라이언트가 첫 GET을 생략할 수 있게 한다.
+        yield 'retry: 5000\n\n'
+        yield f'event: snapshot\ndata: {json.dumps([_summarize(r) for r in approval_store.list_all()])}\n\n'
+        try:
+            while True:
+                if await request.is_disconnected():
+                    break
+                try:
+                    ev = await asyncio.wait_for(queue.get(), timeout=15.0)
+                except asyncio.TimeoutError:
+                    # heartbeat (comment line) — 프록시/브라우저 idle 차단 방지
+                    yield ': keep-alive\n\n'
+                    continue
+                yield f'event: change\ndata: {json.dumps(ev)}\n\n'
+        finally:
+            approval_store.unsubscribe(queue)
+
+    return StreamingResponse(
+        event_gen(),
+        media_type='text/event-stream',
+        headers={
+            'Cache-Control': 'no-cache, no-transform',
+            'X-Accel-Buffering': 'no',  # nginx 앞단 두는 경우 버퍼링 비활성
+        },
+    )
 
 
 @app.post('/approvals/{request_id}/decision')
