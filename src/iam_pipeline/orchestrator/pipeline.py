@@ -398,6 +398,8 @@ class Pipeline:
                                     validation_result,
                                     amp_arns={a for a in buf.policy_arns if is_aws_managed_policy(a)},
                                     request_id=request_id,
+                                    buf=buf,
+                                    target_account_ids=target_account_ids,
                                 )
 
                             policy_details = validation_result.get("policies_validated", {})
@@ -470,6 +472,8 @@ class Pipeline:
                                     validation_result,
                                     amp_arns=new_amp_arns,
                                     request_id=request_id,
+                                    buf=buf,
+                                    target_account_ids=target_account_ids,
                                 )
 
                             policy_details = validation_result.get("policies_validated", {})
@@ -586,12 +590,17 @@ class Pipeline:
         validation_result: dict,
         amp_arns: set[str],
         request_id: str,
+        buf: Optional[RoleBuffer] = None,
+        target_account_ids: Optional[list[str]] = None,
     ) -> None:
         """RAG 거부 결과를 AMP/CMP 별로 처리.
 
         AMP가 confidence=high로 거부된 경우만 RuntimeError로 하드 거부.
         그 외(CMP 거부, low/n/a confidence, RAG 응답 파싱 실패 등)는 경고 로그만 남기고
         반환 → 호출부에서 관리자 승인 단계로 진행.
+
+        하드 거부 시 resource_store에 ``outcome=rag_rejected`` 이벤트를 기록하여
+        리소스 관리 화면에 노출한다.
         """
         policies_validated = validation_result.get("policies_validated", {})
         amp_failures = [
@@ -609,6 +618,19 @@ class Pipeline:
                 f'[{request_id}] RAG rejected AMP(s) with high confidence '
                 f'{amp_failures}: {reason}'
             )
+            if self.resource_store is not None and buf is not None:
+                self.resource_store.record(
+                    request_id=request_id,
+                    account_id=buf.account_id,
+                    role_name=buf.role_name,
+                    action=buf.action.value,
+                    outcome='rag_rejected',
+                    policy_arns=amp_failures,
+                    target_accounts=target_account_ids or [],
+                    requester_iic_user=buf.requester_iic_user,
+                    reviewer=None,
+                    reason=reason,
+                )
             raise RuntimeError(f'Least-privilege validation failed: {reason}')
 
         # CMP 거부 / 낮은 확신도 / 파싱 실패는 모두 관리자 승인으로 위임
