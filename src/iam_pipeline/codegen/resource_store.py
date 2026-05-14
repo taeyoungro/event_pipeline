@@ -78,6 +78,7 @@ class ResourceStore:
         requester_iic_user: Optional[str] = None,
         reviewer: Optional[str] = None,
         ps_name: Optional[str] = None,
+        reason: Optional[str] = None,
     ) -> dict[str, Any]:
         event_id = f'{request_id}-{outcome}'
         record = {
@@ -92,6 +93,7 @@ class ResourceStore:
             'target_accounts': list(target_accounts or []),
             'requester_iic_user': requester_iic_user,
             'reviewer': reviewer,
+            'reason': reason,
             'applied_at': _now_iso(),
         }
         p = self._path(event_id)
